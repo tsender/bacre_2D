@@ -1,0 +1,27 @@
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
+<package format="3">
+  <name>adversarial_scene_gen</name>
+  <version>0.0.1</version>
+  <description>Adversarial scene generation</description>
+  <maintainer email="tsender97@gmail.com">tsender</maintainer>
+  <license>BSD</license>
+
+  <depend>rl_core</depend>
+  <depend>builtin_interfaces</depend>
+  <depend>auto_scene_gen_msgs</depend>
+  <depend>astar_trav</depend>
+  <depend>rosgraph_msgs</depend>
+  <depend>std_msgs</depend>
+  <depend>geometry_msgs</depend>
+  <depend>nav_msgs</depend>
+
+  <test_depend>ament_copyright</test_depend>
+  <test_depend>ament_flake8</test_depend>
+  <test_depend>ament_pep257</test_depend>
+  <test_depend>python3-pytest</test_depend>
+
+  <export>
+    <build_type>ament_python</build_type>
+  </export>
+</package>

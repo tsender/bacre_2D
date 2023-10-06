@@ -1,0 +1,10 @@
+*.pyc
+*.vscode
+**/__pycache__/
+**/checkpoints/*
+*_data/
+**_log.txt
+*.h5
+*.pkl
+*.avi
+*.mp4

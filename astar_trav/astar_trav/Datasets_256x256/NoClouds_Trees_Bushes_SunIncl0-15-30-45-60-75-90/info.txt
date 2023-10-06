@@ -1,0 +1,6 @@
+Image size: 256x256
+Contains:
+    - Juniper trees (BP_SSA_Tree_Juniper_Rocky_Mountain_Field_Desktop)
+    - Barberry bushes (BP_SSA_Bush_Barberry_Desktop2)
+    - all nontraversable.
+Sunlight inclination angles [deg]: 0,15,30,45,60,75,90
