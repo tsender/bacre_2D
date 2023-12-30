@@ -1,0 +1,22 @@
+# This service message is used to convey useful information about the vehicle's last run
+
+uint8 worker_id                 # AutoSceneGenWorker ID sending the request
+int32 scenario_number           # Scenario number that the AutoSceneGenWorker just executed
+
+bool scene_capture_only                 # Indicates if this request only contains scene capture data
+sensor_msgs/Image[] scene_captures      # List of all scene captures (in same order as list of names)
+string[] scene_capture_names            # List of all scene capture names (in same order as list of scene_captures)
+
+uint8 termination_reason                # Reason for ending the simulation
+uint8 REASON_SUCCESS = 0                # Vehicle reached the goal safely within the alloted time
+uint8 REASON_VEHICLE_COLLISION = 1      # Vehicle crashed into a non-traversable obstacle (any form of contact counts as collision)
+uint8 REASON_VEHICLE_FLIPPED = 2        # Vehicle turned or flipped over
+uint8 REASON_SIM_TIMEOUT = 3            # Simulation timeout expired
+uint8 REASON_VEHICLE_IDLING_TIMEOUT = 4 # Vehicle idling timeout experied
+uint8 REASON_VEHICLE_STUCK_TIMEOUT = 5  # Vehicle got stuck enroute (e.g., due to a collision) and could not recover within a certain timeout expired. Note: we separate stuck from having flipped over.
+
+auto_scene_gen_msgs/OdometryWithoutCovariance[] vehicle_trajectory      # The vehicle's trajectory from start to goal
+float32 vehicle_sim_time                # Total length of vehicle simulation time (from when the first control input was received)
+int32 num_vehicle_control_messages      # Number of control messages received by the vehicle (can be cross-checked with how many were sent)
+---
+bool received                   # Indicates the AutoSceneGenClient received the AnalyzeScenario request

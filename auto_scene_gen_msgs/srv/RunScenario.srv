@@ -1,0 +1,29 @@
+# This service message is used to define the scenario that the AutoSceneGenWorker should run
+# RunScenario requests are to be submitted by an external entity from UE4 which we refer to as an AutoSceneGen client
+
+int32 scenario_number                       # Mainly just used to check on progress
+
+float32 sim_timeout_period                  # Maximum amount of time [s] to let the simulation run before terminating. Set to -1 to disable feature.
+float32 vehicle_idling_timeout_period       # Maximum amount of time [s] the vehicle can idle (once it began moving) before terminating the simulation. Set to -1 to disable feature.
+                                            # Idling is defined as being at/near rest while also commanding zero velocity.
+float32 vehicle_stuck_timeout_period        # Maximum amount of time [s] the vehicle can be "stuck", like on an obstacle, before terminating the simulation. Set to -t to disable feature.
+                                            # We define the vehicle as being stuck if it is not moving, has not flipped over, but is still being sent non-zero control commands.
+
+float32 max_vehicle_roll                    # Max allowed vehicle roll angle [deg]. Simulation will end if this threshold is met.
+float32 max_vehicle_pitch                   # Max allowed vehicle pitch angle [deg]. Simulation will end if this threshold is met.
+
+bool allow_collisions                       # If true, then the simulator will not terminate the simulation if the vehicle touches a non-traversable obstacle.
+                                            # If false, then the simulation will terminate with reason REASON_VEHICLE_COLLISION (see AnalyzeScenario.srv) if the vehicle touches a non-traversable obstacle.
+
+geometry_msgs/Point vehicle_start_location  # Vehicle start location in [cm]. The Z location is ignored and will be populated by the AutoSceneGenWorker in UE4
+float32 vehicle_start_yaw                   # Vehicle starting yaw angle in [deg]
+geometry_msgs/Point vehicle_goal_location   # Vehicle goal location in [cm]. The Z location is ignored and will be populated by the AutoSceneGenWorker in UE4
+float32 goal_radius                         # If vehicle is within this distance in [cm] of the goal location, then we assume the vehicle succeeded
+
+auto_scene_gen_msgs/SceneDescription scene_description   # The scene description
+
+bool take_scene_capture                     # Indicates if we should take scene captures to send back to the client
+bool scene_capture_only                     # Indicates if we should only take scene captures after creating the scene (the scneario will NOT be run).
+auto_scene_gen_msgs/SceneCaptureSettings scene_capture_settings     # Scene capture settings
+---
+bool received   # Indicates the AutoSceneGenWorker received the RunScenario request

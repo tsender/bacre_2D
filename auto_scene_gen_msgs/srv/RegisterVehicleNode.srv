@@ -1,0 +1,7 @@
+# This service message is used for each vehicle node to register itself with the AutoSceneGenClient
+# Registering guarantees the AutoSceneGenClient will not proceed until all registered vehicle nodes have indicated they are ready to proceed
+
+uint8 worker_id     # AutoSceneGenWorker ID this node is associated with
+string node_name    # Name of the node to register
+---
+bool received       # Indicates the AutoSceneGenClient received the request

@@ -6,10 +6,6 @@ import io
 import cv2
 import glob
 import numpy as np
-# import matplotlib
-# import matplotlib.pyplot as plt
-# plt.rcParams['figure.dpi'] = 300
-# plt.rcParams['savefig.dpi'] = 300
 import traceback
 import pickle
 import copy
@@ -23,6 +19,8 @@ import matplotlib.pyplot as plt
 import matplotlib.ticker as ticker
 plt.rcParams['figure.dpi'] = 300
 plt.rcParams['savefig.dpi'] = 300
+matplotlib.rcParams['pdf.fonttype'] = 42
+matplotlib.rcParams['ps.fonttype'] = 42
 
 import rclpy
 import rclpy.node
@@ -176,7 +174,7 @@ class Scenario:
     """Keeps track of useful data about a given scenario. Stats about the scenario should be based on the average of the outcomes, as
     running a single trial is not enough to determine how well a vehicle will perform in that scenario (due to non-determinism and consistency issues in simulation).
     """
-    def __init__(self, temp_id: int, parent_id: int, tree_level: int, scene_dscription: auto_scene_gen_msgs.SceneDescription):
+    def __init__(self, temp_id: int, parent_id: int, tree_level: int, scene_description: auto_scene_gen_msgs.SceneDescription):
         """Create a scenario object
         
         Args:
@@ -189,7 +187,7 @@ class Scenario:
         self.temp_id = temp_id # Temporary ID, for logging
         self.parent_id = parent_id # Parent scenario's ID
         self.tree_level = tree_level # The level in the tree that this scenario corresponds to. Root level (parent is None) = 0
-        self.scene_description = scene_dscription # Scene description message
+        self.scene_description = scene_description # Scene description message
         self.opt_path = None                # (N,2) numpy arrays of path points, each row is a (x,y) point
         self.opt_path_len = None
         self.opt_path_cost = None
@@ -201,7 +199,7 @@ class Scenario:
         self.avg_regret = Regret() # The estimated regret for the vehicle in this particular scenario
         
     def get_vehicle_paths(self):
-        """Returns a list of all vehicle paths. In each path, the rows denote the (x,y) pairs."""
+        """Returns a list of all vehicle paths. In each path, the rows denote the (x,y,z) pairs."""
         paths = []
         for outcome in self.outcomes:
             paths.append(outcome.vehicle_path)
@@ -325,19 +323,32 @@ class ScenarioBuilderAndRefAgent(AutoSceneGenScenarioBuilder):
         return opt_path, opt_path_length, opt_cost, opt_path_cost_values
 
     def is_scenario_request_feasible(self, scenario_request: auto_scene_gen_srvs.RunScenario.Request):
-        opt_path, opt_path_len, opt_cost, opt_path_cost_values = self.get_optimal_path(scenario_request)
+        # Are all obstacles outside of obstacle-free radii?
+        start_location = self.opr_attr.get_default_start_location()
+        goal_location = self.opr_attr.get_default_goal_location()
+        visible_obs_xy = np.array(self.get_visible_ssa_locations(scenario_request.scene_description.ssa_array)) # (n,2) array
+        dist_to_start = fast_norm(visible_obs_xy - start_location, axis=-1)
+        dist_to_goal = fast_norm(visible_obs_xy - goal_location, axis=-1)
+        if np.count_nonzero(dist_to_start <= self.start_obstacle_free_radius):
+            return False
+        if np.count_nonzero(dist_to_goal <= self.goal_obstacle_free_radius):
+            return False
         
         # Can optimal agent finish within sim_timeout_period seconds?
+        opt_path, opt_path_len, opt_cost, opt_path_cost_values = self.get_optimal_path(scenario_request)
         opt_sim_time = opt_path_len / self.nominal_vehicle_speed
         if opt_sim_time > scenario_request.sim_timeout_period:
             return False
 
         # Will the optimal agent get too close to any one obstacle?
         visible_obs_xy = np.array(self.get_visible_ssa_locations(scenario_request.scene_description.ssa_array), dtype=np.float32)
-        opt_path_np = np.array(opt_path, dtype=np.float32).reshape((len(opt_path), 1, 2)) # Each major element is a (1,2) array for an (x,y) position (this let's us do tiling)
-        distances = fast_norm(opt_path_np - visible_obs_xy, axis=-1) # Distance from every path point to every obstacle
-        if np.min(distances) < self.opt_agent_min_obstacle_proximity:
-            return False
+        if visible_obs_xy.size == 0:
+            return True
+        else:
+            opt_path_np = np.array(opt_path, dtype=np.float32).reshape((len(opt_path), 1, 2)) # Each major element is a (1,2) array for an (x,y) position (this let's us do tiling)
+            distances = fast_norm(opt_path_np - visible_obs_xy, axis=-1) # Distance from every path point to every obstacle
+            if np.min(distances) < self.opt_agent_min_obstacle_proximity:
+                return False
 
         return True
 
@@ -585,7 +596,7 @@ class BACRE2DAstarTrav(AutoSceneGenClient):
         self.scenario_analysis = None
         self.generated_scenarios : Dict[int, Scenario] = {} # Will use deferred loading for specific scenarios as needed
         if b_loaded:
-            self.log('info', f"Loaded scenario regret manager from: {self.scenario_regret_manager_filepath}")
+            self.log("info", f"Loaded scenario regret manager from: {self.scenario_regret_manager_filepath}")
             self.max_regret_achieved = self.scenario_regret_manager.sorted_regrets[0][1]
 
             self.scenario_analysis, b_loaded2 = self.load_scenario_analysis(self.scenario_analysis_filepath)
@@ -594,7 +605,7 @@ class BACRE2DAstarTrav(AutoSceneGenClient):
             else:
                 self.log("info", f"Could not load scenario analysis")
         else:
-            self.log('info', f"Could not load scenario regret manager from file. Creating one from scratch.")
+            self.log("info", f"Could not load scenario regret manager from file. Creating one from scratch.")
 
         # Mode of operation
         self.mode = {
@@ -615,8 +626,8 @@ class BACRE2DAstarTrav(AutoSceneGenClient):
             raise ValueError(f"Unrecognized mode of operation '{mode}'")
 
         # Uncomment when needed, can take a few minutes to run
-        # self.plot_max_regret_scenes()
         # self.plot_max_regret_scenario_tree()
+        # self.plot_max_regret_scenes()
         # self.plot_scenario_rankings()
 
         self.log("info", f"Configuringing mode: {mode}")
@@ -624,10 +635,11 @@ class BACRE2DAstarTrav(AutoSceneGenClient):
             self.mode[self.MODE_BACRE] = True
             self.b_in_testing_mode = True
             if self.scenario_regret_manager.num_scenarios() >= self.num_env_to_generate:
-                self.log('info', f"Done creating scenarios.")
+                self.log("info", f"Done creating scenarios.")
                 self.mode[self.MODE_BACRE] = False
                 self.b_in_testing_mode = False
             self.plot_scenario_rankings()
+            self.plot_max_regret_scene()
         
         elif mode == self.MODE_REPLAY:
             self.mode[self.MODE_REPLAY] = True
@@ -643,18 +655,21 @@ class BACRE2DAstarTrav(AutoSceneGenClient):
             self.mode[self.MODE_RANDOM] = True
             self.b_in_testing_mode = True
             if self.scenario_regret_manager.num_scenarios() >= self.num_env_to_generate:
-                self.log('info', f"Done creating scenarios.")
+                self.log("info", f"Done creating scenarios.")
                 self.mode[self.MODE_RANDOM] = False
                 self.b_in_testing_mode = False
             self.plot_scenario_rankings()
+            self.plot_max_regret_scene()
 
         elif mode == self.MODE_ANALYSIS:
             self.generated_scenarios : Dict[int, Scenario] = self.load_generated_scenarios(self.dirs["scenarios"], self.scenario_regret_manager)
             self.plot_scenario_rankings()
+            self.plot_max_regret_scene()
             self.analyze_generated_scenarios_snapshots()
 
         elif mode == self.MODE_ANALYSIS_PLOT:
             self.plot_scenario_rankings()
+            self.plot_max_regret_scene()
             self.plot_scenario_analysis()
 
         elif mode == self.MODE_ANALYSIS_REPLAY:
@@ -669,31 +684,6 @@ class BACRE2DAstarTrav(AutoSceneGenClient):
 
         self.log("info", "Initialized BACRE 2D")
         self.log("info", "-" * 60, b_log_ros=False)
-
-    def is_in_mode(self, mode: str):
-        """Check if the AutoSceneGenClient is in a specific mode
-
-        Args:
-            - mode: Mode to check for
-
-        Returns:
-            - True if in specified mode, Flase otherwise.
-        """
-        if mode not in self.mode.keys():
-            return False
-
-        if mode == self.MODE_BACRE:
-            return self.mode[self.MODE_BACRE] and not self.mode[self.MODE_REPLAY] and not self.mode[self.MODE_RANDOM]
-
-        if mode == self.MODE_REPLAY:
-            return self.mode[self.MODE_REPLAY] and not self.mode[self.MODE_BACRE] and not self.mode[self.MODE_RANDOM]
-
-        if mode == self.MODE_RANDOM:
-            return self.mode[self.MODE_RANDOM] and not self.mode[self.MODE_BACRE] and not self.mode[self.MODE_REPLAY]
-
-        if mode == self.MODE_SCENE_CAPTURE:
-            return self.mode[self.MODE_SCENE_CAPTURE]
-        return False
 
     def load_scenario_regret_manager(self, file_path: str):
         """Load scenario regret manager from file, if it exists.
@@ -717,7 +707,7 @@ class BACRE2DAstarTrav(AutoSceneGenClient):
         """Save the internal scenario regret manager"""
         with open(self.scenario_regret_manager_filepath, 'wb') as f:
             pickle.dump(self.scenario_regret_manager, f, pickle.HIGHEST_PROTOCOL)
-        self.log('info', f"Saved scenario regret manager to file: {self.scenario_regret_manager_filepath}")
+        self.log("info", f"Saved scenario regret manager to file: {self.scenario_regret_manager_filepath}")
 
     def load_scenario_analysis(self, file_path: str):
         """Load scenario analysis from file, if it exists.
@@ -747,11 +737,11 @@ class BACRE2DAstarTrav(AutoSceneGenClient):
             self.log("error", f"Cannot save scenario with ID None.")
             return
         
-        if self.is_in_mode(self.MODE_BACRE) or self.is_in_mode(self.MODE_RANDOM):
+        if self.mode[self.MODE_BACRE] or self.mode[self.MODE_RANDOM]:
             file_path = os.path.join(self.dirs["scenarios"], f"scenario_{scenario.id}.pkl")
             with open(file_path, 'wb') as f:
                 pickle.dump(scenario, f, pickle.HIGHEST_PROTOCOL)
-            self.log('info', f"Saved scenario with ID {scenario.id} to file: {file_path}")
+            self.log("info", f"Saved scenario with ID {scenario.id} to file: {file_path}")
         else:
             self.log("warn", f"Can only save scenario with this function in mode '{self.MODE_BACRE}' or '{self.MODE_RANDOM}'.")
             return
@@ -987,7 +977,7 @@ class BACRE2DAstarTrav(AutoSceneGenClient):
         fig.clf()
 
         # Plot regret rankings and tree levels
-        if not self.is_in_mode(self.MODE_RANDOM):
+        if not self.mode[self.MODE_RANDOM]:
             fig, ax = plt.subplots(2,1,num=1)
             # 1. Regret
             ax[0].plot(rankings, regrets, linewidth=1, color='black')
@@ -1006,7 +996,7 @@ class BACRE2DAstarTrav(AutoSceneGenClient):
         
         # Plot regret vs. ranking for first X best scenarios
         for num_best in (500,100):
-            if self.is_in_mode(self.MODE_RANDOM):
+            if self.mode[self.MODE_RANDOM]:
                 fig, ax = plt.subplots(num=1)
                 # 1. Regret
                 ax.plot(rankings[:num_best], regrets[:num_best], linewidth=1, color='black')
@@ -1040,19 +1030,6 @@ class BACRE2DAstarTrav(AutoSceneGenClient):
         fig.savefig(os.path.join(self.dirs['figures'], 'scenario_regret_histogram.pdf'))
         fig.savefig(os.path.join(self.dirs['figures'], 'scenario_regret_histogram.png'))
         fig.clf()
-
-        # # Plot max regret vs number of scenarios
-        # fig, ax = plt.subplots(num=1)
-        # # Max Regret
-        # ax.axvline(self.num_base_env, linewidth=1, color="red", label="Number of Base Scenarios")
-        # ax.plot(rankings, max_regret_over_time, linewidth=1, color="black")
-        # ax.set_xlabel(f"Number of Scenarios Tested", fontsize=fontsize)
-        # ax.set_ylabel("Max Regret", fontsize=fontsize)
-        # ax.legend(loc = "lower right", fontsize=legend_fontsize)
-        # ax.tick_params(axis="both", which="major", labelsize=fontsize)
-        # fig.tight_layout()
-        # fig.savefig(os.path.join(self.dirs['figures'], 'max_regret_vs_num_scenarios.pdf'))
-        # fig.clf()
 
         # Plot regret vs number of scenarios
         fig, ax = plt.subplots(num=10)
@@ -1103,23 +1080,23 @@ class BACRE2DAstarTrav(AutoSceneGenClient):
                 fig.savefig(os.path.join(self.dirs['figures'], f"regret_vs_tree_level_top{num_best}.png"))
                 fig.clf()
 
-        # Plot max regret scenario
+        self.log("info", "Plotted scenario rankings")
+
+    def plot_max_regret_scene(self):
         best_scenario_id, _ = self.scenario_regret_manager.sorted_regrets[0]
         best_scenario = self.get_generated_scenario_from_id(best_scenario_id)
         self.max_regret_achieved = best_scenario.avg_regret.value
-        self.log('info', f"Max regret achieved: {self.max_regret_achieved:.4f}")
+        self.log("info", f"Max regret achieved: {self.max_regret_achieved:.4f}")
 
         file_name = os.path.join(self.dirs['figures'], 'scene_max_regret')
         self.plot_scene_from_scenario(best_scenario, file_name)
 
         info_file_name = os.path.join(self.dirs['figures'], 'scene_max_regret_info.txt')
         with open(info_file_name, "w") as f:
-            f.write(f"Iter {self.scenario_regret_manager.num_scenarios()} / Max Regret: {self.max_regret_achieved:.2f}")
-
-        self.log("info", "Plotted scenario rankings")
+            f.write(f"ID {best_scenario_id} / Max Regret: {self.max_regret_achieved:.4f}")
 
     def plot_max_regret_scenario_tree(self):
-        self.log('info', f"Plotting scenario tree for max regret scenario...")
+        self.log("info", f"Plotting scenario tree for max regret scenario...")
         best_scenario_id, _ = self.scenario_regret_manager.sorted_regrets[0]
         best_scenario = self.get_generated_scenario_from_id(best_scenario_id)
         self.max_regret_achieved = best_scenario.avg_regret.value
@@ -1127,7 +1104,7 @@ class BACRE2DAstarTrav(AutoSceneGenClient):
 
     def plot_max_regret_scenes(self):
         """Plot some of the highest regret scenarios"""
-        self.log('info', f"Plotting max regret scenarios...")
+        self.log("info", f"Plotting max regret scenarios...")
         plot_dir = os.path.join(self.dirs['figures'], 'max_regret_scenarios')
 
         # Delete existing directory, if it exists, then remake it
@@ -1141,10 +1118,9 @@ class BACRE2DAstarTrav(AutoSceneGenClient):
 
         # Plot max regret scenario
         best_scenario_id, _ = self.scenario_regret_manager.sorted_regrets[0]
-        # best_scenario = self.generated_scenarios[best_scenario_id]
         best_scenario = self.get_generated_scenario_from_id(best_scenario_id)
         self.max_regret_achieved = best_scenario.avg_regret.value
-        self.log('info', f"Max regret achieved: {self.max_regret_achieved:.4f}")
+        self.log("info", f"Max regret achieved: {self.max_regret_achieved:.4f}")
         
         file_name = os.path.join(self.dirs['figures'], 'scene_max_regret')
         self.plot_scene_from_scenario(best_scenario, file_name)
@@ -1155,8 +1131,7 @@ class BACRE2DAstarTrav(AutoSceneGenClient):
         # Plot top X ranked scenarios
         num_scenarios_to_plot = min(self.num_difficult_scenarios_to_plot, self.scenario_regret_manager.num_scenarios())
         for i in range(num_scenarios_to_plot):
-            id, _ = self.scenario_regret_manager.sorted_regrets[i]
-            # scenario = self.generated_scenarios[id]
+            id, regret = self.scenario_regret_manager.sorted_regrets[i]
             scenario = self.get_generated_scenario_from_id(id)
             scene_plot_dir = os.path.join(plot_dir, f"rank_{i+1}")
             os.makedirs(scene_plot_dir, exist_ok = True)
@@ -1165,11 +1140,14 @@ class BACRE2DAstarTrav(AutoSceneGenClient):
             file_name = os.path.join(scene_plot_dir, f'scene_rank_{i+1}_id_{id}')
             self.plot_scene_from_scenario(scenario, file_name)
 
+            info_file_name = os.path.join(scene_plot_dir, f'regret_info.txt')
+            with open(info_file_name, "w") as f:
+                f.write(f"Rank {i+1} / ID {id} / Regret: {regret:.4f}")
+
             # Plot curves showing the regret over the perturbations. Plot all the scenes from base scenario to final child.
             regrets_over_time = [scenario.avg_regret.value]
             parent_id = scenario.parent_id
             while parent_id is not None:
-                # parent = self.generated_scenarios[parent_id]
                 parent = self.get_generated_scenario_from_id(parent_id)
                 regrets_over_time.insert(0, parent.avg_regret.value)
                 parent_id = parent.parent_id
@@ -1196,7 +1174,6 @@ class BACRE2DAstarTrav(AutoSceneGenClient):
         scenario_tree : List[Scenario] = [scenario]
         parent_id = scenario.parent_id
         while parent_id is not None:
-            # parent = self.generated_scenarios[parent_id]
             parent = self.get_generated_scenario_from_id(parent_id)
             scenario_tree.insert(0,parent)
             parent_id = parent.parent_id
@@ -1399,7 +1376,6 @@ class BACRE2DAstarTrav(AutoSceneGenClient):
 
         self.log("info", F"Verifying all scenarios have required data fields...")
         for id in range(self.scenario_regret_manager.num_scenarios()):
-            # scenario = self.generated_scenarios[id]
             scenario = self.get_generated_scenario_from_id(id)
             for j,outcome in enumerate(scenario.outcomes):
                 if outcome.astar_path_snapshots is None:
@@ -1416,7 +1392,6 @@ class BACRE2DAstarTrav(AutoSceneGenClient):
         counter = 0
         self.scenario_analysis = ScenarioAnalysis()
         for id in range(self.scenario_regret_manager.num_scenarios()):
-            # scenario = self.generated_scenarios[id]
             scenario = self.get_generated_scenario_from_id(id)
             
             (mean_astar_replan_angle, 
@@ -1623,6 +1598,12 @@ class BACRE2DAstarTrav(AutoSceneGenClient):
             sub_dirs = [f.path for f in os.scandir(rd) if f.is_dir()]
             for sd in sub_dirs:
                 self.log("info", f"Reanalyzing replays in: {sd}")
+
+                # Remove old files in scenario directory?
+                files = glob.glob(os.path.join(sd, "*.pdf")) + glob.glob(os.path.join(sd, "*.png"))
+                for file in files:
+                    os.remove(file)
+
                 self.analyze_replay_scenario(sd, scenario=None)
 
     def plot_group_summary(self, group_summary_dict: Dict, figure_prefix: str):
@@ -1889,7 +1870,8 @@ class BACRE2DAstarTrav(AutoSceneGenClient):
         b_mosaic = True
         if fig is None:
             b_mosaic = False
-            fig, main_ax = plt.subplots(num=1) # Create new figure/axes
+            fig, ax = plt.subplots(num=1) # Create new figure/axes
+            main_ax = ax
             marker_scale = 1.
             fontsize = 12.
             # for border in main_ax.spines.values():
@@ -1941,7 +1923,7 @@ class BACRE2DAstarTrav(AutoSceneGenClient):
 
         main_ax.plot(opt_path_x, opt_path_y, zorder=3, linestyle='--', linewidth=1*marker_scale, color=self.COLOR_OPT_REF_PATH, label="Opt. Ref. Path")
 
-        return fig, main_ax, b_mosaic
+        return fig, ax, b_mosaic
     
     def plot_scene_from_scenario(self, 
                                   scenario: Scenario, 
@@ -2050,8 +2032,8 @@ class BACRE2DAstarTrav(AutoSceneGenClient):
                 legend.get_frame().set_facecolor(self.COLOR_LEGEND)
                 
                 fig.savefig(file_name_prefix + f"_wlegend_figwidth{fig_width}.pdf", bbox_inches='tight', pad_inches=0.1*marker_scale)
-                # fig.savefig(file_name_prefix + "_wlegned.svg", bbox_inches='tight', pad_inches=0.1*marker_scale, dpi=dpi)
-                fig.savefig(file_name_prefix + f"_wlegned_figwidth{fig_width}.png", bbox_inches='tight', pad_inches=0.1*marker_scale, dpi=dpi)
+                # fig.savefig(file_name_prefix + "_wlegend.svg", bbox_inches='tight', pad_inches=0.1*marker_scale, dpi=dpi)
+                fig.savefig(file_name_prefix + f"_wlegend_figwidth{fig_width}.png", bbox_inches='tight', pad_inches=0.1*marker_scale, dpi=dpi)
 
         fig.clf()
         plt.close(fig)
@@ -2255,10 +2237,14 @@ class BACRE2DAstarTrav(AutoSceneGenClient):
                 img_filepath = os.path.join(save_dir, name + ".png")
                 cv2.imwrite(img_filepath, img)
         
-        # Do not procees if the request only contained scene captures
+        # Do not process rest of AnalyzeScenario request if the request only contained scene captures
         if worker.analyze_scenario_request.scene_capture_only:
-            self.log('info', f"Processed AnalyzeScenario request (scene capture only) for Worker {wid} / SN {worker.analyze_scenario_request.scenario_number}")
-            return True
+            if len(worker.analyze_scenario_request.scene_captures) == 0:
+                self.log("warn", "AnalyzeScenario request is scene capture only but 'scene_captures' field is empty.")
+                return False
+            else:
+                self.log("info", f"Processed AnalyzeScenario request (scene capture only) for Worker {wid} / SN {worker.analyze_scenario_request.scenario_number}")
+                return True
 
         if len(worker.analyze_scenario_request.vehicle_trajectory) == 0:
             self.log("warn", "AnalyzeScenario request field 'vehicle_trajectory' is empty. Requesting rerun.")
@@ -2284,56 +2270,16 @@ class BACRE2DAstarTrav(AutoSceneGenClient):
         # Extract full trajectory info into lists
         time_since_start = []
         xyz_full = []
-        # sin_yaw_full = []
-        # cos_yaw_full = []
-        # yaw_rates_full = []
         yaw_angles_full = []
         quat_full = []
         for odom in worker.analyze_scenario_request.vehicle_trajectory:
             time_since_start.append(stamp_utils.get_stamp_dt(start_stamp, odom.header.stamp))
             xyz_full.append(np.array([odom.pose.position.x, odom.pose.position.y, odom.pose.position.z], dtype=np.float32))
-            # yaw_rates_full.append(odom.twist.angular.z)
             
             quat = [odom.pose.orientation.w, odom.pose.orientation.x, odom.pose.orientation.y, odom.pose.orientation.z]
-            euler = transforms3d.euler.quat2euler(quat, 'rzyx')
+            euler = transforms3d.euler.quat2euler(quat, "rzyx")
             yaw_angles_full.append(euler[0])
             quat_full.append(quat)
-            # sin_yaw_full.append(math.sin(euler[0]))
-            # cos_yaw_full.append(math.cos(euler[0]))
-
-        # vehicle_path = [] # (x,y) in [m]
-        # yaw_rates = [] # In [rad/s]
-        # yaw_angles = [] # In [rad]
-
-        # sample_dt = sim_time / (self.num_state_vehicle_waypoints - 1)
-        # sample_times = sample_dt * np.arange(self.num_state_vehicle_waypoints, dtype=np.float32)
-
-        # Sample data temporally from lists with linear interpolation
-        # i = 0
-        # for j in range(len(time_since_start)-1):
-        #     T = time_since_start[j+1] - time_since_start[j]
-        #     while sample_times[i] < time_since_start[j+1]:
-        #         dt = sample_times[i] - time_since_start[j]
-
-        #         vehicle_path.append(linear_interp(xy_full[j], xy_full[j+1], dt / T))
-        #         yaw_rates.append(linear_interp(yaw_rates_full[j], yaw_rates_full[j+1], dt / T))
-                
-        #         # Cannot interpolate yaw angle directly due to the inherent discontinuity in its definition
-        #         cos_angle = linear_interp(cos_yaw_full[j], cos_yaw_full[j+1], dt / T)
-        #         sin_angle = linear_interp(sin_yaw_full[j], sin_yaw_full[j+1], dt / T)
-        #         yaw_angles.append(math.atan2(sin_angle, cos_angle)) # Range [-pi, pi]
-
-        #         # Increment i and check if done (stop at N-1)
-        #         i += 1
-        #         if i == self.num_state_vehicle_waypoints - 1:
-        #             break
-        #     if i == self.num_state_vehicle_waypoints - 1:
-        #             break
-
-        # # Append last element
-        # vehicle_path.append(xy_full[-1])
-        # yaw_rates.append(yaw_rates_full[-1])
-        # yaw_angles.append(math.atan2(sin_yaw_full[-1], cos_yaw_full[-1]))
         
         # Add scenario outcome
         outcome = ScenarioOutcome()
@@ -2348,7 +2294,7 @@ class BACRE2DAstarTrav(AutoSceneGenClient):
         worker.vehicle_path = outcome.vehicle_path
 
         # worker.b_analyzed_scenario = True
-        self.log('info', f"Processed AnalyzeScenario request for Worker {wid} / SN {worker.analyze_scenario_request.scenario_number}")
+        self.log("info", f"Processed AnalyzeScenario request for Worker {wid} / SN {worker.analyze_scenario_request.scenario_number}")
         return True
 
     def compute_regret(self, wid: int):
@@ -2361,8 +2307,8 @@ class BACRE2DAstarTrav(AutoSceneGenClient):
         regret = Regret()
         regret.set_to_zero()
 
-        start_location = np.array(self.scenario_builder.opr_attr.get_default_start_location())
-        goal_location = np.array(self.scenario_builder.opr_attr.get_default_goal_location())
+        start_location = self.scenario_builder.opr_attr.get_default_start_location()
+        goal_location = self.scenario_builder.opr_attr.get_default_goal_location()
 
         self.scenario_builder.configure_reference_agent(worker.run_scenario_request)
 
@@ -2441,13 +2387,13 @@ class BACRE2DAstarTrav(AutoSceneGenClient):
         funcs = []
         if num_inactive > 0:
             probs.append(self.ssa_add_prob)
-            funcs.append(self.scenario_builder.add_rand_ssa)
+            funcs.append(self.scenario_builder.add_random_ssa)
         if num_active >= 2:
             probs.append(self.ssa_remove_prob)
-            funcs.append(self.scenario_builder.remove_rand_ssa)
+            funcs.append(self.scenario_builder.remove_random_ssa)
         if num_active > 0: 
             probs.append(self.ssa_perturb_prob)
-            funcs.append(self.scenario_builder.perturb_rand_ssa)
+            funcs.append(self.scenario_builder.perturb_random_ssa)
 
         # Make sure array sums to 1
         probs = np.array(probs) / np.sum(probs)
@@ -2466,13 +2412,103 @@ class BACRE2DAstarTrav(AutoSceneGenClient):
         return False # This return should almost never happen
 
     def can_create_new_scenario(self):
-        """Indictaes if we can create any more base scenarios"""
+        """Indicates if we can create any more base scenarios"""
         if self.scenario_regret_manager.num_scenarios() < self.num_base_env:
             if self.scenario_regret_manager.num_scenarios() + self.num_workers_running_base_scenarios() < self.num_base_env:
                 return True
             else:
                 return False
         return True
+    
+    def get_parent_id_for_mutation(self):
+        # Hyperparameter annealing
+        n = self.scenario_regret_manager.num_scenarios() - self.num_base_env
+        if n < self.anneal_duration:
+            ratio = n/self.anneal_duration
+            prob_rand = linear_interp(self.initial_prob_editing_random_env, self.prob_editing_random_env, ratio)
+            rcr = linear_interp(self.initial_regret_curation_ratio, self.regret_curation_ratio, ratio)
+        else:
+            prob_rand = self.prob_editing_random_env
+            rcr = self.regret_curation_ratio
+
+        # Select a random parent scenario
+        parent_id = None
+        if np.random.rand() < prob_rand:
+            parent_id = np.random.randint(self.scenario_regret_manager.num_scenarios())
+        
+        # Select parent based on primary selection method
+        else:
+            # Upper search quantile
+            if self.parent_selection_method == self.PAR_SELECT_UPPER_QUANTILE:
+                num_top_scenarios = math.ceil(self.scenario_regret_manager.num_scenarios() * self.upper_search_quantile)
+                idx = np.random.randint(num_top_scenarios)
+                parent_id = self.scenario_regret_manager.sorted_regrets[idx][0]
+            
+            # Regret curation ratio
+            elif self.parent_selection_method == self.PAR_SELECT_RCR or self.parent_selection_method == self.PAR_SELECT_RCR_WITH_PARENTS:
+                cutoff_num = 0 # The number of scenarios we will consider in the sorted scenarios list (ranked best to worst)
+                largest_regret = self.scenario_regret_manager.sorted_regrets[0][1]
+                smallest_regret = self.scenario_regret_manager.sorted_regrets[-1][1]
+
+                if largest_regret == smallest_regret:
+                    cutoff_num = self.scenario_regret_manager.num_scenarios()
+                else:
+                    for i in range(self.scenario_regret_manager.num_scenarios()-1):
+                        try:
+                            if (self.scenario_regret_manager.sorted_regrets[i+1][1] - smallest_regret) / (largest_regret - smallest_regret) <= 1. - rcr:
+                                cutoff_num = i + 1
+                                break
+                        except ZeroDivisionError:
+                            cutoff_num = i + 1
+                            break
+                    if cutoff_num == 0:
+                        cutoff_num = self.scenario_regret_manager.num_scenarios()
+                
+                if self.parent_selection_method == self.PAR_SELECT_RCR:
+                    # Pick from the best cutoff_num scenarios IDs
+                    idx = np.random.randint(cutoff_num)
+                    parent_id = self.scenario_regret_manager.sorted_regrets[idx][0]
+                else:
+                    # Add the best cutoff_num scenarios IDs and their parents
+                    selection_ids = []
+                    aur_parent_ids = []
+                    for i in range(cutoff_num):
+                        aur_id = self.scenario_regret_manager.sorted_regrets[i][0]
+                        aur_parent_id = self.get_generated_scenario_from_id(aur_id).parent_id
+                        selection_ids.append(aur_id)
+                        aur_parent_ids.append(aur_parent_id)
+                    
+                    for id in aur_parent_ids:
+                        if id is not None and id not in selection_ids:
+                            selection_ids.append(id)
+                    
+                    idx = np.random.randint(len(selection_ids))
+                    parent_id = selection_ids[idx]
+        
+        return parent_id
+
+    def add_reference_trajectory_to_scenario(self, scenario: Scenario, scenario_request):
+        """
+        Args:
+            - scenario: Scenario to fill in reference trajectory data
+            - scenario_request: The corresponding RunScenario request
+        """
+        # Add opt path, time, and cost to scenario
+        opt_path, opt_path_len, opt_path_cost, opt_path_cost_values = self.scenario_builder.get_optimal_path(scenario_request)
+        scenario.opt_path = np.array(opt_path)
+        scenario.opt_path_len = opt_path_len
+        scenario.opt_path_cost = opt_path_cost
+        scenario.opt_path_cost_values = opt_path_cost_values
+        scenario.opt_path_time = opt_path_len / self.scenario_builder.nominal_vehicle_speed
+
+        # Get opt time values
+        opt_path_time_values = [0.]
+        for i in range(len(opt_path)-1):
+            edge_length_ratio = fast_norm(opt_path[i+1] - opt_path[i]) / opt_path_len
+            dt = edge_length_ratio * scenario.opt_path_time
+            opt_path_time_values.append(opt_path_time_values[-1] + dt)
+        opt_path_time_values[-1] = scenario.opt_path_time # Explicitly set this in case there are precision errors
+        scenario.opt_path_time_values = opt_path_time_values
 
     def create_scenario(self, wid: int):
         """Create a new scenario for the given worker, reset/update any necessary variables, and submit the scenario request.
@@ -2487,85 +2523,23 @@ class BACRE2DAstarTrav(AutoSceneGenClient):
         parent_id = None
         tree_level = 0
 
-        if not self.is_in_mode(self.MODE_RANDOM):
+        if self.mode[self.MODE_BACRE]:
             if self.scenario_regret_manager.num_scenarios() < self.num_base_env:
                 if self.scenario_regret_manager.num_scenarios() + self.num_workers_running_base_scenarios() < self.num_base_env:
                     # Create base scenario
                     self.log("info", "Creating base scenario...")
                     worker.b_running_base_scenario = True
                     scenario_request = self.scenario_builder.create_default_run_scenario_request()
-                    self.scenario_builder.add_rand_ssa(scenario_request)
+                    self.scenario_builder.add_random_ssa(scenario_request)
                 else:
-                    return # Just have to wait
+                    return # Just have to wait until base population is created
             else:
-                self.log("info", "Creating child scenario...")
-
-                # Hyperparameter annealing
-                n = self.scenario_regret_manager.num_scenarios() - self.num_base_env
-                if n < self.anneal_duration:
-                    ratio = n/self.anneal_duration
-                    prob_rand = linear_interp(self.initial_prob_editing_random_env, self.prob_editing_random_env, ratio)
-                    rcr = linear_interp(self.initial_regret_curation_ratio, self.regret_curation_ratio, ratio)
-                else:
-                    prob_rand = self.prob_editing_random_env
-                    rcr = self.regret_curation_ratio
-
-                # Select a random parent scenario
-                if np.random.rand() < prob_rand:
-                    parent_id = np.random.randint(self.scenario_regret_manager.num_scenarios())
-                
-                # Select parent based on primary selection method
-                else:
-                    # Upper search quantile
-                    if self.parent_selection_method == self.PAR_SELECT_UPPER_QUANTILE:
-                        num_top_scenarios = math.ceil(self.scenario_regret_manager.num_scenarios() * self.upper_search_quantile)
-                        idx = np.random.randint(num_top_scenarios)
-                        parent_id = self.scenario_regret_manager.sorted_regrets[idx][0]
-                    
-                    # Regret curation ratio
-                    elif self.parent_selection_method == self.PAR_SELECT_RCR or self.parent_selection_method == self.PAR_SELECT_RCR_WITH_PARENTS:
-                        cutoff_num = 0 # The number of scenarios we will consider in the sorted scenarios list (ranked best to worst)
-                        largest_regret = self.scenario_regret_manager.sorted_regrets[0][1]
-                        smallest_regret = self.scenario_regret_manager.sorted_regrets[-1][1]
-
-                        if largest_regret == smallest_regret:
-                            cutoff_num = self.scenario_regret_manager.num_scenarios()
-                        else:
-                            for i in range(self.scenario_regret_manager.num_scenarios()-1):
-                                try:
-                                    if (self.scenario_regret_manager.sorted_regrets[i+1][1] - smallest_regret) / (largest_regret - smallest_regret) <= 1. - rcr:
-                                        cutoff_num = i + 1
-                                        break
-                                except ZeroDivisionError:
-                                    cutoff_num = i + 1
-                                    break
-                            if cutoff_num == 0:
-                                cutoff_num = self.scenario_regret_manager.num_scenarios()
-                        
-                        if self.parent_selection_method == self.PAR_SELECT_RCR:
-                            # Pick from the best cutoff_num scenarios IDs
-                            idx = np.random.randint(cutoff_num)
-                            parent_id = self.scenario_regret_manager.sorted_regrets[idx][0]
-                        else:
-                            # Add the best cutoff_num scenarios IDs and their parents
-                            selection_ids = []
-                            aur_parent_ids = []
-                            for i in range(cutoff_num):
-                                aur_id = self.scenario_regret_manager.sorted_regrets[i][0]
-                                aur_parent_id = self.get_generated_scenario_from_id(aur_id).parent_id
-                                selection_ids.append(aur_id)
-                                aur_parent_ids.append(aur_parent_id)
-                            
-                            for id in aur_parent_ids:
-                                if id is not None and id not in selection_ids:
-                                    selection_ids.append(id)
-                            
-                            idx = np.random.randint(len(selection_ids))
-                            parent_id = selection_ids[idx]
-
                 # Modify the parent scene description
+                self.log("info", "Creating child scenario...")
+                parent_id = self.get_parent_id_for_mutation()
+                parent_scenario = self.get_generated_scenario_from_id(parent_id)
                 scenario_request = self.scenario_builder.create_default_run_scenario_request()
-                scenario_request.scene_description = copy.deepcopy(self.get_generated_scenario_from_id(parent_id).scene_description)
+                scenario_request.scene_description = copy.deepcopy(parent_scenario.scene_description)
                 if len(self.scenario_builder.ssa_attr.var_attrs) > 0 and len(self.scenario_builder.txt_attr.var_attrs) > 0:
                     if np.random.rand() > 0.5:
                         self._perturb_str_attr(scenario_request)
@@ -2581,7 +2555,7 @@ class BACRE2DAstarTrav(AutoSceneGenClient):
             num_ssa = np.random.randint(self.scenario_builder.num_var_ssa_instances) + 1
             self.log("info", f"Creating random scenario with {num_ssa} SSAs...")
             for i in range(num_ssa):
-                self.scenario_builder.add_rand_ssa(scenario_request)
+                self.scenario_builder.add_random_ssa(scenario_request)
 
         # Do not do scene captures yet as the images can take up a LOT of space
         scenario_request.take_scene_capture = False
@@ -2592,27 +2566,10 @@ class BACRE2DAstarTrav(AutoSceneGenClient):
         if parent_id is not None:
             tree_level = self.get_generated_scenario_from_id(parent_id).tree_level + 1
         worker.scenario = Scenario(self.scenario_regret_manager.get_new_temp_id(), parent_id, tree_level, scenario_request.scene_description)
-
-        # Add opt path, time, and cost to scenario
-        opt_path, opt_path_len, opt_path_cost, opt_path_cost_values = self.scenario_builder.get_optimal_path(scenario_request)
-        worker.scenario.opt_path = np.array(opt_path)
-        worker.scenario.opt_path_len = opt_path_len
-        worker.scenario.opt_path_cost = opt_path_cost
-        worker.scenario.opt_path_cost_values = opt_path_cost_values
-        worker.scenario.opt_path_time = opt_path_len / self.scenario_builder.nominal_vehicle_speed
-
-        # Get opt time values
-        opt_path_time_values = [0.]
-        for i in range(len(opt_path)-1):
-            edge_length_ratio = fast_norm(opt_path[i+1] - opt_path[i]) / opt_path_len
-            dt = edge_length_ratio * worker.scenario.opt_path_time
-            opt_path_time_values.append(opt_path_time_values[-1] + dt)
-        opt_path_time_values[-1] = worker.scenario.opt_path_time # Explicitly set this in case there are precision errors
-        worker.scenario.opt_path_time_values = opt_path_time_values
-
+        self.add_reference_trajectory_to_scenario(worker.scenario, scenario_request)
         worker.b_need_new_scenario = False
 
-        self.log('info', f"Created new scenario (w/parent ID = {parent_id}) in {time.time() - start_time:.4f} seconds for worker {wid}")
+        self.log("info", f"Created new scenario (w/parent ID = {parent_id}) in {time.time() - start_time:.4f} seconds for worker {wid}")
         self.submit_run_scenario_request(wid)
 
     def load_vehicle_node_data(self, wid: int):
@@ -2684,7 +2641,7 @@ class BACRE2DAstarTrav(AutoSceneGenClient):
 
         if worker.b_need_new_scenario:
             if self.can_create_new_scenario():
-                self.log('info', "-" * 30 + f'BACRE STEP (wid {wid})' + "-" * 30, b_log_ros=False)
+                self.log("info", "-" * 30 + f'BACRE STEP (wid {wid})' + "-" * 30, b_log_ros=False)
             self.create_scenario(wid)
             return
                 
@@ -2692,7 +2649,7 @@ class BACRE2DAstarTrav(AutoSceneGenClient):
         if worker.b_waiting_for_analyze_scenario_request:
             return
 
-        self.log('info', "-" * 30 + f'BACRE STEP (wid {wid})' + "-" * 30, b_log_ros=False)
+        self.log("info", "-" * 30 + f'BACRE STEP (wid {wid})' + "-" * 30, b_log_ros=False)
         if not self.process_analyze_scenario_request(wid):
             return
         
@@ -2746,12 +2703,7 @@ class BACRE2DAstarTrav(AutoSceneGenClient):
 
         if worker.scenario.avg_regret.value > self.max_regret_achieved:
             self.max_regret_achieved = worker.scenario.avg_regret.value
-            file_name = os.path.join(self.dirs['figures'], 'scene_max_regret')
-            self.plot_scene_from_scenario(worker.scenario, file_name)
-            
-            info_file_name = os.path.join(self.dirs['figures'], 'scene_max_regret_info.txt')
-            with open(info_file_name, "w") as f:
-                f.write(f"Iter {self.scenario_regret_manager.num_scenarios()} / Max Regret: {self.max_regret_achieved:.2f}")
+            self.plot_max_regret_scene()
 
         if self.scenario_regret_manager.num_scenarios() % self.data_save_freq == 0:
             self.save_scenario_regret_manager()
@@ -2767,7 +2719,7 @@ class BACRE2DAstarTrav(AutoSceneGenClient):
 
         # Check if done creating scenarios
         if self.scenario_regret_manager.num_scenarios() >= self.num_env_to_generate:
-            self.log('info', f"Done creating adversarial scenes. Created {self.num_env_to_generate} scenes. Entering replay mode.")
+            self.log("info", f"Done creating adversarial scenes. Created {self.num_env_to_generate} scenes. Entering replay mode.")
             self.mode[self.MODE_BACRE] = False
             self.mode[self.MODE_SCENE_CAPTURE] = True
 
@@ -2776,11 +2728,11 @@ class BACRE2DAstarTrav(AutoSceneGenClient):
                 self.cancel_submitting_run_scenario_request(wid2)
 
             self.save_scenario_regret_manager()
+            self.plot_scenario_rankings()
             self.analyze_generated_scenarios_snapshots()
             self.process_scene_capture_request()
 
             # Run scene captures
-            # self.plot_scenario_rankings()
             # self.plot_max_regret_scenes()
             # self.process_replay_request()
             return
@@ -2904,7 +2856,7 @@ class BACRE2DAstarTrav(AutoSceneGenClient):
         worker.run_scenario_request = self.scenario_builder.create_default_run_scenario_request()
         worker.run_scenario_request.scene_description = worker.scenario.scene_description
 
-        self.log('info', f"Replaying scenario for Worker {wid}")
+        self.log("info", f"Replaying scenario for Worker {wid}")
         self.submit_run_scenario_request(wid)
 
     def run_replay_step(self, wid: int):
@@ -2924,7 +2876,7 @@ class BACRE2DAstarTrav(AutoSceneGenClient):
         if wid not in self.replay_worker_scenario_idx.keys():            
             if self.num_replay_scenarios_not_started > 0 and (worker.scenario_number == 0 or not worker.b_waiting_for_analyze_scenario_request):
                 b_copied_worker = False
-                self.log('info', "-" * 30 + f'REPLAY (wid {wid})' + "-" * 30, b_log_ros=False)
+                self.log("info", "-" * 30 + f'REPLAY (wid {wid})' + "-" * 30, b_log_ros=False)
                 try:
                     self.worker_backups[wid] = copy.deepcopy(worker) # Backup original worker, we will get back to it later
                     b_copied_worker = True
@@ -2947,11 +2899,11 @@ class BACRE2DAstarTrav(AutoSceneGenClient):
         if worker.b_waiting_for_analyze_scenario_request:
             return
 
-        self.log('info', "-" * 30 + f'REPLAY (wid {wid})' + "-" * 30, b_log_ros=False)
+        self.log("info", "-" * 30 + f'REPLAY (wid {wid})' + "-" * 30, b_log_ros=False)
         if not self.process_analyze_scenario_request(wid):
             return
 
-        self.log('info', f"Replay Worker {wid} / Scenario Index {self.replay_worker_scenario_idx[wid]} / Replay {worker.num_scenario_runs}: Regret = {worker.scenario.outcomes[-1].regret.value:.4f}")
+        self.log("info", f"Replay Worker {wid} / Scenario Index {self.replay_worker_scenario_idx[wid]} / Replay {worker.num_scenario_runs}: Regret = {worker.scenario.outcomes[-1].regret.value:.4f}")
 
         # Add vehicle node data to scenario outcome
         b_loaded_vehicle_node_data = self.load_vehicle_node_data(wid)
@@ -2986,7 +2938,7 @@ class BACRE2DAstarTrav(AutoSceneGenClient):
             parent_dir = os.path.abspath(os.path.join(worker.vehicle_node_save_dir, '..'))
             
             worker.scenario.estimate_regret()
-            self.log('info', f"Replay Worker {wid} / Scenario Index {self.replay_worker_scenario_idx[wid]} / Replay {worker.num_scenario_runs}: Avg. Regret = {worker.scenario.avg_regret.value:.4f}")
+            self.log("info", f"Replay Worker {wid} / Scenario Index {self.replay_worker_scenario_idx[wid]} / Replay {worker.num_scenario_runs}: Avg. Regret = {worker.scenario.avg_regret.value:.4f}")
             
             # Save replay scenario with all outcomes
             replay_scenario_file = os.path.join(parent_dir, "scenario.pkl")
@@ -3013,7 +2965,7 @@ class BACRE2DAstarTrav(AutoSceneGenClient):
                 self.mode[self.MODE_REPLAY] = False
                 self.mode[self.MODE_REPLAY_FROM_DIR] = False
                 self.replay_worker_scenario_idx.clear()
-                self.log('info', f"Finished replay mode")
+                self.log("info", f"Finished replay mode")
 
                 return
 
@@ -3034,7 +2986,7 @@ class BACRE2DAstarTrav(AutoSceneGenClient):
         worker.b_save_minimal = True
 
         if worker.b_need_new_scenario:
-            self.log('info', "-" * 30 + f'RANDOM STEP (wid {wid})' + "-" * 30, b_log_ros=False)
+            self.log("info", "-" * 30 + f'RANDOM STEP (wid {wid})' + "-" * 30, b_log_ros=False)
             self.create_scenario(wid)
             return
                 
@@ -3042,7 +2994,7 @@ class BACRE2DAstarTrav(AutoSceneGenClient):
         if worker.b_waiting_for_analyze_scenario_request:
             return
 
-        self.log('info', "-" * 30 + f'RANDOM STEP (wid {wid})' + "-" * 30, b_log_ros=False)
+        self.log("info", "-" * 30 + f'RANDOM STEP (wid {wid})' + "-" * 30, b_log_ros=False)
         if not self.process_analyze_scenario_request(wid):
             return
 
@@ -3096,12 +3048,7 @@ class BACRE2DAstarTrav(AutoSceneGenClient):
 
         if worker.scenario.avg_regret.value > self.max_regret_achieved:
             self.max_regret_achieved = worker.scenario.avg_regret.value
-            file_name = os.path.join(self.dirs['figures'], 'scene_max_regret')
-            self.plot_scene_from_scenario(worker.scenario, file_name)
-
-            info_file_name = os.path.join(self.dirs['figures'], 'scene_max_regret_info.txt')
-            with open(info_file_name, "w") as f:
-                f.write(f"Iter {self.scenario_regret_manager.num_scenarios()} / Max Regret: {self.max_regret_achieved:.2f}")
+            self.plot_max_regret_scene()
 
         if self.scenario_regret_manager.num_scenarios() % self.data_save_freq == 0:
             self.save_scenario_regret_manager()
@@ -3117,7 +3064,7 @@ class BACRE2DAstarTrav(AutoSceneGenClient):
 
         # Check if done creating scenarios
         if self.scenario_regret_manager.num_scenarios() >= self.num_env_to_generate:
-            self.log('info', f"Done creating random scenes. Created {self.num_env_to_generate} scenes. Entering replay mode.")
+            self.log("info", f"Done creating random scenes. Created {self.num_env_to_generate} scenes. Entering replay mode.")
             self.mode[self.MODE_RANDOM] = False
             self.mode[self.MODE_SCENE_CAPTURE] = True
 
@@ -3126,10 +3073,10 @@ class BACRE2DAstarTrav(AutoSceneGenClient):
                 self.cancel_submitting_run_scenario_request(wid2)
 
             self.save_scenario_regret_manager()
+            self.plot_scenario_rankings()
             self.analyze_generated_scenarios_snapshots()
             self.process_scene_capture_request()
 
-            # self.plot_scenario_rankings()
             # self.plot_max_regret_scenes()
             # self.process_replay_request()
             return
@@ -3147,20 +3094,26 @@ class BACRE2DAstarTrav(AutoSceneGenClient):
         worker.run_scenario_request.take_scene_capture = True
         worker.run_scenario_request.scene_capture_only = True
         worker.run_scenario_request.scene_capture_settings = copy.deepcopy(self.scene_capture_settings)
-        # worker.b_need_new_scenario = False
 
-        self.log('info', f"Recreating scenario for scene captures for Worker {wid} / Scenario ID {scenario_id}")
+        self.log("info", f"Recreating scenario for scene captures for Worker {wid} / Scenario ID {scenario_id}")
         self.submit_run_scenario_request(wid)
 
     def run_scene_capture_step(self, wid: int):
         if not self.mode[self.MODE_SCENE_CAPTURE]:
             return
         
+        # Only workers with rosbridge nodes running on same computer as the client can perform scene captures due to the large image sizes
+        if wid not in self.local_wids:
+            return
+        
+        if not self.are_all_vehicle_nodes_ready(wid):
+            return
+        
         worker : ASGWorkerRef = self.workers[wid]
 
-        if wid not in self.scene_capture_worker_idx.keys():            
+        if wid not in self.scene_capture_worker_idx.keys():
             if self.num_scene_captures_not_started > 0 and (worker.scenario_number == 0 or not worker.b_waiting_for_analyze_scenario_request):
-                self.log('info', "-" * 30 + f'SCENE CAPTURE STEP (wid {wid})' + "-" * 30, b_log_ros=False)
+                self.log("info", "-" * 30 + f'SCENE CAPTURE STEP (wid {wid})' + "-" * 30, b_log_ros=False)
                 self.scene_capture_worker_idx[wid] = len(self.scene_capture_scenario_ids) - self.num_scene_captures_not_started
                 self.num_scene_captures_not_started -= 1 # This line comes after we set the idx
                 scenario_id = self.scene_capture_scenario_ids[self.scene_capture_worker_idx[wid]]
@@ -3173,7 +3126,7 @@ class BACRE2DAstarTrav(AutoSceneGenClient):
         if worker.b_waiting_for_analyze_scenario_request:
             return
 
-        self.log('info', "-" * 30 + f'SCENE CAPTURE STEP (wid {wid})' + "-" * 30, b_log_ros=False)
+        self.log("info", "-" * 30 + f'SCENE CAPTURE STEP (wid {wid})' + "-" * 30, b_log_ros=False)
         if not self.process_analyze_scenario_request(wid):
             return
         self.num_scene_captures_completed += 1
@@ -3197,7 +3150,7 @@ class BACRE2DAstarTrav(AutoSceneGenClient):
 
             if self.b_in_testing_mode:
                 self.mode[self.MODE_REPLAY] = True
-                self.plot_scenario_rankings()
+                self.plot_max_regret_scene()
                 self.plot_max_regret_scenes()
                 self.plot_max_regret_scenario_tree()
                 self.process_replay_request()
@@ -3209,7 +3162,7 @@ class BACRE2DAstarTrav(AutoSceneGenClient):
         """
         self.b_done_testing = not self.mode[self.MODE_BACRE] and not self.mode[self.MODE_REPLAY] and not self.mode[self.MODE_RANDOM] and not self.mode[self.MODE_SCENE_CAPTURE]
         if self.b_done_testing:
-            self.log('info', "Done testing")
+            self.log("info", "Done testing")
             return
 
         worker : ASGWorkerRef = self.workers[wid]
@@ -3219,7 +3172,7 @@ class BACRE2DAstarTrav(AutoSceneGenClient):
             return
         
         # Scene capture mode
-        if self.is_in_mode(self.MODE_SCENE_CAPTURE):
+        if self.mode[self.MODE_SCENE_CAPTURE]:
             self.run_scene_capture_step(wid)
             return
         
@@ -3227,15 +3180,15 @@ class BACRE2DAstarTrav(AutoSceneGenClient):
             return
 
         # Adversarial mode
-        if self.is_in_mode(self.MODE_BACRE):
+        if self.mode[self.MODE_BACRE]:
             self.run_bacre_step(wid)
 
         # Replay mode
-        elif self.is_in_mode(self.MODE_REPLAY):
+        elif self.mode[self.MODE_REPLAY]:
             self.run_replay_step(wid)
 
         # Random mode
-        elif self.is_in_mode(self.MODE_RANDOM):
+        elif self.mode[self.MODE_RANDOM]:
             self.run_random_step(wid)
 
 def main(args=None):
@@ -3244,7 +3197,7 @@ def main(args=None):
     if "/src" not in path_prefix:
         path_prefix = os.path.join(path_prefix, "src")
     path_prefix = os.path.join(path_prefix, "bacre_data", 'astar_trav_2D', f"iterative_experiments")
-    main_dir = os.path.join(path_prefix, "sunyaw0_rcr0.05_av1") # Folder for storing all data w.r.t. an individual experiment
+    main_dir = os.path.join(path_prefix, "sunyaw0_rcr0.05_av3") # Folder for storing all data w.r.t. an individual experiment
 
     if not os.path.isdir(main_dir):
         os.makedirs(main_dir)
@@ -3341,12 +3294,13 @@ def main(args=None):
     auto_scene_gen_client_dict = {
         "node_name": "bacre_2D_astar_trav",
         "main_dir": main_dir,
-        "asg_client_name": "asg_client",        # Name of the AutoSceneGen client
-        "num_vehicle_nodes": 2,                 # Number of vehicle nodes in the vehicle's the autonomy stack
-        "num_workers": 12,                      # Number of AutoSceneGen workers
-        "base_wid": 0,                          # Base (lowest) AutoSceneGen worker ID
+        "asg_client_name": "asg_client",        # Name of the AutoSceneGenClient
+        "num_vehicle_nodes": 3,                 # Number of vehicle nodes in the vehicle's the autonomy stack
+        "num_workers": 12,                      # Number of AutoSceneGenWorkers
+        "base_wid": 0,                          # Base (lowest) AutoSceneGenWorker ID
+        "local_wids": list(range(6)),
         "worker_class": ASGWorkerRef,            # Class of type AutoSceneGenWorker, used to instantiate the worker references
-        "scenario_builder": scenario_builder
+        "scenario_builder": scenario_builder,
     }
 
     # Replay request options
@@ -3354,15 +3308,15 @@ def main(args=None):
     # 2. Replay scenario or rankings from different experiment (with same parameters): {..., 'dir': '../exp2'}
     
     bacre_dict = {
-        "mode": BACRE2DAstarTrav.MODE_BACRE,         # Modes of operation: training, inference, replay, replay_from_dir, random
+        "mode": BACRE2DAstarTrav.MODE_ANALYSIS_REPLAY,         # Modes of operation: training, inference, replay, replay_from_dir, random
         "replay_request": {"request": "rankings", "rank_range": [1,10], "num_replays": 3}, # Replay request
         "num_runs_per_scenario": 3,          # Number of times we run each scenario for to predict the difficulty for the test vehicle
         "num_base_env": 200,                               # Number of base or "seed" environments to create
         "num_env_to_generate": 5000,                       # Number of new environments to generate per iteration
-        "initial_prob_editing_random_env": 0.5,
+        "initial_prob_editing_random_env": 0.1, # .5
         "prob_editing_random_env": 0.1,                 # Probability of choosing a random parent environment to edit (over all generated levels)
         "upper_search_quantile": 0.01,                   # Specifies the upper quantile of high-regret scenarios from which to randomly choose from
-        "initial_regret_curation_ratio": 0.5,             # Specifies the desired regret curation ratio
+        "initial_regret_curation_ratio": 0.05, # .5             # Specifies the initial regret curation ratio
         "regret_curation_ratio": 0.05,             # Specifies the desired regret curation ratio
         "anneal_duration": 1000,
         "parent_selection_method": BACRE2DAstarTrav.PAR_SELECT_RCR,  # Method for selecting a scenario's parent
@@ -3381,6 +3335,7 @@ def main(args=None):
     group_summary_dict = {
         "BACRE": (("sunyaw0_rcr0.05_av4_run1", "sunyaw0_rcr0.05_av4_run2", "sunyaw0_rcr0.05_av4_run3", "sunyaw0_rcr0.05_av4_run4", "sunyaw0_rcr0.05_av4_run5"), "blue"),
         "BACRE w/Annealing": (("sunyaw0_rcr0.05_anneal_av4_run1", "sunyaw0_rcr0.05_anneal_av4_run2", "sunyaw0_rcr0.05_anneal_av4_run3", "sunyaw0_rcr0.05_anneal_av4_run4", "sunyaw0_rcr0.05_anneal_av4_run5"), "green"),
+        # "BACRE w/ROI": (("sunyaw0_rcr0.05_roi5_av4_run1", "sunyaw0_rcr0.05_roi5_av4_run2", "sunyaw0_rcr0.05_roi5_av4_run3", "sunyaw0_rcr0.05_roi5_av4_run4"), "orange"),
         "Random": (("sunyaw0_rand_av4_run1", "sunyaw0_rand_av4_run2", "sunyaw0_rand_av4_run3", "sunyaw0_rand_av4_run4", "sunyaw0_rand_av4_run5"), "red"),
     }
 
@@ -3435,11 +3390,11 @@ def main(args=None):
     except KeyboardInterrupt:
         asg.log("info", "Keyboard interrupt. Shutting down...")
     except Exception as e:
-        asg.log('error', f"EXCEPTION: {traceback.format_exc()}") # Print entire exception and source of problem
+        asg.log("error", f"EXCEPTION: {traceback.format_exc()}") # Print entire exception and source of problem
     finally:
         asg.shutdown()
         asg.destroy_node()
         rclpy.shutdown()
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()

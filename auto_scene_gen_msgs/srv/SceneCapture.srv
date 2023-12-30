@@ -1,0 +1,9 @@
+# Request for sending the requested scene captures of the UE4 simulation
+
+uint8 worker_id             # AutoSceneGen worker ID sending the scene captures
+int32 scenario_number       # Scenario number corresponding to the scene captures
+
+sensor_msgs/Image[] scene_captures  # List of all scene captures (in same order as list of names)
+string[] scene_capture_names        # List of all scene capture names (in same order as list of images)
+---
+bool received   # Indicates the AutoSceneGenClient received the scene captures

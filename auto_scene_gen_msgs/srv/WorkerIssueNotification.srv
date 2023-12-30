@@ -1,0 +1,11 @@
+# This services is to be invoked by the AutoSceneGenWorker to inform the AutoSceneGenClient of an issue
+
+uint8 worker_id # Worker ID sending the notification
+
+uint8 ISSUE_ROSBRIDGE_INTERRUPTED = 0
+uint8 ISSUE_PROBLEM_CREATING_SCENE = 1
+uint8 issue_id  # ID for the issue at hand
+
+string message # Message string, if any message needs to be relaid to the AutoSceneGen client. Can be empty.
+---
+bool received                   # Indicates the AutoSceneGenClient received the notification

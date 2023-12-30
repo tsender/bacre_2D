@@ -1,0 +1,11 @@
+# This service message is used for each vehicle node to notify the AutoSceneGenClient that it is ready for the next scenario
+# These notifications allow the client to ensure all nodes are ready before proceeding on to the next scenario
+
+uint8 worker_id             # AutoSceneGenWorker ID this node is associated with
+string node_name            # Name of the registered node
+uint32 last_scenario_number # Last scenario number that was just ran
+bool request_rerun          # Indicate if the vehicle node wants to rerun the previous scenario (e.g. due to a problem it encountered)
+string reason_for_rerun     # Reason for requesting a rerun
+---
+bool received               # Indicates the AutoSceneGenClient received the notification
+bool accepted               # Indicates the AutoSceneGenClient accepted the request. False means it was ignored (since it accepted the first request)
