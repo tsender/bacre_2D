@@ -25,8 +25,6 @@ matplotlib.rcParams['ps.fonttype'] = 42
 import rclpy
 import rclpy.node
 import std_msgs.msg as std_msgs
-# import nav_msgs.msg as nav_msgs
-# import builtin_interfaces.msg as builtin_interfaces
 
 import auto_scene_gen_msgs.msg as auto_scene_gen_msgs
 import auto_scene_gen_msgs.srv as auto_scene_gen_srvs
@@ -40,9 +38,6 @@ from astar_trav.astar_voting_path_planner import AstarVotingPathPlanner
 from astar_trav.astar_trav_2D_all_in_one_node import AstarPathSnapshot, AstarSnapshotsSummary
 from astar_trav.simple_path_follower_node import PathFollowerTrackingSnapshot, PathFollowerSnapshotsSummary
 
-# NOTE on running ros1_bridge: 
-# To list all ros1_bridge pairs: ros2 run ros1_bridge dynamic_bridge --print-pairs
-# To run ros1_bridge: ros2 run ros1_bridge dynamic_bridge --bridge-all-topics
 
 def fast_norm(vector: np.float32, axis: int = None):
     """Faster way to compute numpy vector norm than np.linalg.norm()"""
@@ -353,10 +348,10 @@ class ScenarioBuilderAndRefAgent(AutoSceneGenScenarioBuilder):
         return True
 
 
-class ASGWorkerRef(AutoSceneGenWorkerRef):
-    """Extension of the Adversarial Scene Generator AutoSceneGenWorkerRef class."""
+class BACREWorkerRef(AutoSceneGenWorkerRef):
+    """Extension of the AutoSceneGenWorkerRef class for BACRE."""
     def __init__(self, wid: int):
-        """Initialize an ASGWorkerRef
+        """Initialize an BACREWorkerRef
         
         Args:
             -wid: Worker ID
@@ -366,15 +361,15 @@ class ASGWorkerRef(AutoSceneGenWorkerRef):
         self.num_scenario_runs = 0
         self.b_need_new_scenario = True
         self.b_running_base_scenario = False
-        self.vehicle_path = None # Numpy array, each row is a (x,y,z) pair from the discetized vehicle path in [m]
 
     def reset(self):
         self.scenario = None
         self.run_scenario_request = None
+        self.analyze_scenario_request = None
         self.num_scenario_runs = 0
-        self.b_need_new_scenario = False
+        self.b_need_new_scenario = True
         self.b_running_base_scenario = False
-        self.vehicle_path = None
+        self.num_resubmission_attempts = 0
 
     def add_scenario_outcome(self, outcome: ScenarioOutcome):
         """Add a scenario outcome. The provided outcome should have most of its fields already populated."""
@@ -404,6 +399,7 @@ class ScenarioRegretManager:
         self.max_regret_over_time : List[Tuple[int, float]] = [] # List of (scenario ID, maximum regret) attained at the given time
         self.scenario_tree_levels : List[int] = []
         self.next_temp_id = -1 # Do not access this directly, use the function
+        self.failure_rate : Dict[int, int] = {} # Key = scenario ID, value = fraction of outcomes that resulted in failure
 
     def add_scenario(self, scenario: Scenario):
         scenario.id = len(self.scenario_regrets) # Set scenario ID here
@@ -422,6 +418,9 @@ class ScenarioRegretManager:
                 self.max_regret_over_time.append(self.max_regret_over_time[-1])
 
         self.scenario_tree_levels.append(scenario.tree_level)
+
+        nsucc, nfail = scenario.get_outcome_distribution()
+        self.failure_rate[scenario.id] = nfail / (nsucc + nfail)
 
     def num_scenarios(self):
         return len(self.scenario_regrets)
@@ -452,28 +451,217 @@ class ScenarioAnalysis:
         self.mean_astar_replan_durations : List[float] = []
         self.max_astar_replan_durations : List[float] = []
 
+########## CGA Classes and Functions
+        
+class CGAPopulationManager:
+    """Class to store CGA scenario info in one place."""
+    def __init__(self):
+        self.population_idxs : List[List[int]] = [] # Each element is a list of scenario indeces that make up the population
+        self.population_parent_idxs : List[List[Tuple[int]]] = [] # Each element is a list of tuples indicating the parents for that population
+        self.avg_population_regret : List[float] = []
+        self.max_population_regret : List[float] = []
+
+    def num_populations(self):
+        return len(self.population_idxs)
+
+def get_cga_chromosome(scene_description: auto_scene_gen_msgs.SceneDescription, scenario_builder: ScenarioBuilderAndRefAgent):
+    """ Get positional-only chromosomal data
+    Returns:
+        - chromosome
+        - min_values
+        - max_values
+    """
+    chromo = []
+    min_values = []
+    max_values = []
+    xrange = scenario_builder.ssa_attr.x.range
+    yrange = scenario_builder.ssa_attr.y.range
+
+    for layout in scene_description.ssa_array:
+        chromo += list(layout.x)
+        min_values += [xrange[0]] * layout.num_instances
+        max_values += [xrange[1]] * layout.num_instances
+
+        chromo += list(layout.y)
+        min_values += [yrange[0]] * layout.num_instances
+        max_values += [yrange[1]] * layout.num_instances
+
+    return np.array(chromo), np.array(min_values), np.array(max_values)
+
+def cga_chromosome_to_scene_description(chromosome, scenario_builder: ScenarioBuilderAndRefAgent):
+    scene_description = scenario_builder.create_default_scene_description_msg()
+    i = 0
+    for layout in scene_description.ssa_array:
+        x = chromosome[i:i+layout.num_instances]
+        layout.x = x.tolist()
+        i += layout.num_instances
+
+        y = chromosome[i:i+layout.num_instances]
+        layout.y = y.tolist()
+        i += layout.num_instances
+
+        layout.visible = [True] * layout.num_instances
+    return scene_description
+
+def cga_mate_and_mutate(p1: np.float32, p2: np.float32, mutation_prob: float, min_values: np.float32, max_values: np.float32):
+    """Create two children from mating parent1 and parent2"""
+    np.random.seed()
+    crossover = np.random.randint(p1.size)
+
+    # Perform crossover
+    if crossover == p1.size-1:
+        c1 = p2.copy()
+        c1[-1] = p1[-1]
+        c2 = p1.copy()
+        c2[-1] = p2[-1]
+    else:
+        c1 = p1.copy()
+        c2 = p2.copy()
+        c1[crossover+1:] = p2[crossover+1:]
+        c2[crossover+1:] = p1[crossover+1:]
+
+    # Change crossover point with linear interpolation
+    beta = np.random.rand()
+    c1[crossover] = (1-beta)*p1[crossover] + beta*p2[crossover]
+    c2[crossover] = (1-beta)*p2[crossover] + beta*p1[crossover]
+
+    # Mutate
+    prob1 = np.random.rand(p1.size) # Mutation probability
+    prob2 = np.random.rand(p1.size)
+    rand1 = min_values + np.random.rand(p1.size) * (max_values - min_values) # New random values within allowed range
+    rand2 = min_values + np.random.rand(p1.size) * (max_values - min_values)
+    c1[prob1 < mutation_prob] = rand1[prob1 < mutation_prob]
+    c2[prob2 < mutation_prob] = rand2[prob2 < mutation_prob]
+
+    return c1, c2
+    
+def add_reference_trajectory_to_scenario(scenario: Scenario, scenario_request, scenario_builder: ScenarioBuilderAndRefAgent):
+    """
+    Args:
+        - scenario: Scenario to fill in reference trajectory data
+        - scenario_request: The corresponding RunScenario request
+        - scenario_builder: The corresponding scenario builder
+    """
+    # Add opt path, time, and cost to scenario
+    opt_path, opt_path_len, opt_path_cost, opt_path_cost_values = scenario_builder.get_optimal_path(scenario_request)
+    scenario.opt_path = np.array(opt_path)
+    scenario.opt_path_len = opt_path_len
+    scenario.opt_path_cost = opt_path_cost
+    scenario.opt_path_cost_values = opt_path_cost_values
+    scenario.opt_path_time = opt_path_len / scenario_builder.nominal_vehicle_speed
+
+    # Get opt time values
+    opt_path_time_values = [0.]
+    for i in range(len(opt_path)-1):
+        edge_length_ratio = fast_norm(opt_path[i+1] - opt_path[i]) / opt_path_len
+        dt = edge_length_ratio * scenario.opt_path_time
+        opt_path_time_values.append(opt_path_time_values[-1] + dt)
+    opt_path_time_values[-1] = scenario.opt_path_time # Explicitly set this in case there are precision errors
+    scenario.opt_path_time_values = opt_path_time_values
+
+def multiprocess_create_cga_scenarios(pid: int, parent1: Scenario, parent2: Scenario, mutation_prob: float, scenario_builder: ScenarioBuilderAndRefAgent, temp_ids: List[int], save_dir: str):
+    # Assumes that only the positional (x,y) elements of the SSAs are part of the chromosome
+    np.random.seed()
+    
+    start_location = scenario_builder.opr_attr.get_default_start_location()
+    goal_location = scenario_builder.opr_attr.get_default_goal_location()
+
+    # Create random scenarios for first population
+    if parent1 is None and parent2 is None:
+        for idx, temp_id in enumerate(temp_ids):
+            start_time = time.time()
+            
+            b_feasible = False
+            while not b_feasible:
+                scenario_request = scenario_builder.create_default_run_scenario_request()
+                for layout in scenario_request.scene_description.ssa_array:
+                    for i in range(layout.num_instances):
+                        # Find (x,y) coordinate outside obstacle-free radii (this is probably faster than repeatedly calling add_random_ssa())
+                        while True:
+                            x = scenario_builder.ssa_attr.x.random()
+                            y = scenario_builder.ssa_attr.y.random()
+                            if fast_norm(start_location - np.array([x,y])) <= scenario_builder.start_obstacle_free_radius:
+                                continue
+                            if fast_norm(goal_location - np.array([x,y])) <= scenario_builder.goal_obstacle_free_radius:
+                                continue
+                            break
+                        layout.x[i] = x
+                        layout.y[i] = y
+                        layout.visible[i] = True
+                b_feasible = scenario_builder.is_scenario_request_feasible(scenario_request)
+
+            # Create scenario
+            scenario = Scenario(temp_id, None, 0, scenario_request.scene_description)
+            add_reference_trajectory_to_scenario(scenario, scenario_request, scenario_builder)
+            file_path = os.path.join(save_dir, f"scenario_temp_{temp_id}.pkl")
+            with open(file_path, 'wb') as f:
+                pickle.dump(scenario, f, pickle.HIGHEST_PROTOCOL)
+            print(f"[Parallel Worker {pid}] ({idx+1} of {len(temp_ids)}) Child scenario w/temp ID {temp_id}) processed in {time.time()-start_time:.4f} seconds.")
+        
+    # Create new CGA population
+    else:
+        n = 0
+        p1_chromo, min_chromo, max_chromo = get_cga_chromosome(parent1.scene_description, scenario_builder)
+        p2_chromo, _, _ = get_cga_chromosome(parent2.scene_description, scenario_builder)
+        while n < len(temp_ids):
+            start_time = time.time()
+            c1_chromo, c2_chromo = cga_mate_and_mutate(p1_chromo, p2_chromo, mutation_prob, min_chromo, max_chromo)
+
+            # Chromo 1
+            scenario_request = scenario_builder.create_default_run_scenario_request()
+            scenario_request.scene_description = cga_chromosome_to_scene_description(c1_chromo, scenario_builder)
+
+            if scenario_builder.is_scenario_request_feasible(scenario_request):
+                scenario = Scenario(temp_ids[n], (parent1.id, parent2.id), parent1.tree_level+1, scenario_request.scene_description)
+                add_reference_trajectory_to_scenario(scenario, scenario_request, scenario_builder)
+                file_path = os.path.join(save_dir, f"scenario_temp_{temp_ids[n]}.pkl")
+                with open(file_path, 'wb') as f:
+                    pickle.dump(scenario, f, pickle.HIGHEST_PROTOCOL)
+                print(f"[Parallel Worker {pid}] ({n+1} of {len(temp_ids)}) Child 1 of 2 scenario w/temp ID {temp_ids[n]}) processed in {time.time()-start_time:.4f} seconds.")
+                n += 1
+
+            if n == len(temp_ids):
+                break
+            
+            # Chromo 2
+            scenario_request = scenario_builder.create_default_run_scenario_request()
+            scenario_request.scene_description = cga_chromosome_to_scene_description(c2_chromo, scenario_builder)
+
+            if scenario_builder.is_scenario_request_feasible(scenario_request):
+                scenario = Scenario(temp_ids[n], (parent1.id, parent2.id), parent1.tree_level+1, scenario_request.scene_description)
+                add_reference_trajectory_to_scenario(scenario, scenario_request, scenario_builder)
+                file_path = os.path.join(save_dir, f"scenario_temp_{temp_ids[n]}.pkl")
+                with open(file_path, 'wb') as f:
+                    pickle.dump(scenario, f, pickle.HIGHEST_PROTOCOL)
+                print(f"[Parallel Worker {pid}] ({n+1} of {len(temp_ids)}) Child 2 of 2 scenario w/temp ID {temp_ids[n]}) processed in {time.time()-start_time:.4f} seconds.")
+                n += 1
+
+    print(f"[Parallel Worker {pid}] Done")
+
+##########
 
 class BACRE2DAstarTrav(AutoSceneGenClient):
-    """Black-box Adversarially Compounding Regret on a 2D horizontal plane for the A* trav vehicle model.
+    """Class that implements Black-Box Adversarially Compounding Regret Through Evolution (BACRE) and various other methods
+    for testing the A* trav vehicle model on a 2D horizontal plane.
     Fully integrated with the UE4 AutomaticSceneGeneration plugin.
 
     NOTE: This class expects all position measurements to be in [m] and expressed in a right-handed north-west-up coordinate frame.
     """
     # Modes
-    MODE_BACRE = "bacre"
-    MODE_REPLAY = "replay"
-    MODE_REPLAY_FROM_DIR = "replay_from_dir"
-    MODE_RANDOM = "random"
-    MODE_ANALYSIS = "analysis"
-    MODE_ANALYSIS_PLOT = "analysis_plot"
-    MODE_ANALYSIS_REPLAY = "analysis_replay"
-    MODE_SCENE_CAPTURE = "scene_capture"
+    # NOTE: When using MODE_BACRE, MODE_RANDOM, or MODE_CGA the code will automatically follow with ANALYSIS, SCENE_CAPTURE, and REPLAY
+    MODE_BACRE = "bacre"                        # Run BACRE algorithm to create adversarial scenarios
+    MODE_RANDOM = "random"                      # Generate random scenarios
+    MODE_CGA = "continuous_genetic_algorithm"   # Run CGA to create adversarial scenarios
+    MODE_ANALYSIS = "analysis"                  # Analyze all generated scenarios (according to user-specific needs)
+    MODE_ANALYSIS_PLOT = "analysis_plot"        # Make plots based on latest analysis
+    MODE_ANALYSIS_REPLAY = "analysis_replay"    # Make plots and analyze replayed scenarios
+    MODE_SCENE_CAPTURE = "scene_capture"        # Capture various point-of-views (images) from certain scenarios (see SCR_ options below)
+    MODE_REPLAY = "replay"                      # Replay certain scenarios by ranking (allows you to save/log additional vehicle node data for further analysis)
 
     # Parent selection options
     PAR_SELECT_UPPER_QUANTILE = "upper_quantile_search"
     PAR_SELECT_RCR = "regret_curation_ratio"
-    PAR_SELECT_RCR_WITH_PARENTS = "regret_curation_ratio_with_parents"
-    PAR_SELECT_METHODS = (PAR_SELECT_UPPER_QUANTILE, PAR_SELECT_RCR, PAR_SELECT_RCR_WITH_PARENTS)
+    PAR_SELECT_METHODS = (PAR_SELECT_UPPER_QUANTILE, PAR_SELECT_RCR)
 
     # Scene capture request (SCR) options
     SCR_ID = "id"   # Capture scenes by ID
@@ -498,37 +686,50 @@ class BACRE2DAstarTrav(AutoSceneGenClient):
     COLOR_LEGEND ="white"
 
     PLOT_PADDING = 5.
-    MAX_RERUN_REQUESTS = 3
+    MAX_RERUN_REQUESTS = 3 # Maximum number of times the autonomy system can request a rerun for the last scenario. Can sometimes be useful if there actually was a problem (e.g., due to ROS2)
 
     def __init__(self, 
                 auto_scene_gen_client_dict: Dict,               # Dictionary of parameters for the base AutoSceneGenClient
-                mode: str,                                      # Primary mode of operation: training, inference, replay, replay_from dir, random
-                replay_request: Dict,                           # Replay request
+                mode: str,                                      # Primary mode of operation, see MODE_* options above
                 num_runs_per_scenario: int,                     # Number of times we run each scenario for to predict the difficulty for the test vehicle
                 num_base_env: int,                              # Number of base or "seed" environments to create
                 num_env_to_generate: int,                       # Number of new environments to generate per iteration
-                initial_prob_editing_random_env: float,
+                num_mutations: int,                             # Number of mutations made when creating a child scenario
+                b_regret_uses_equivalent_x_errors: bool,        # Indicates if the regret calculation should ignore the equivalent-x errors
+                initial_prob_editing_random_env: float,         # Initial probability of choosing a random parent environment to edit
                 prob_editing_random_env: float,                 # Probability of choosing a random parent environment to edit (over all generated levels)
                 upper_search_quantile: float,                   # Specifies the upper quantile of high-regret scenarios from which to randomly choose from
-                initial_regret_curation_ratio: float,
-                regret_curation_ratio: float,                   # Specifies the ratio of scenarios that make up this fraction of the regret range
-                anneal_duration: int,                           # Number of iterations to anneal the above hyperparameters
+                initial_regret_curation_ratio: float,           # Specifies the initial upper fraction of the population's regret range from which to curate scenarios from
+                regret_curation_ratio: float,                   # Specifies the upper fraction of the population's regret range from which to curate scenarios from
+                anneal_duration: int,                           # Number of iterations to anneal the above hyperparameters over (after creating the base population). Applies to 'prob_editing_random_env' and 'regret_curation_ratio'.
                 parent_selection_method: str,                   # Method for selecting a scenario's parent
-                ssa_add_prob: float,
-                ssa_remove_prob: float,
-                ssa_perturb_prob: float,
+                ssa_add_prob: float,                            # Nominal probability for adding an SSA
+                ssa_remove_prob: float,                         # Nominal probability for perturbing an existing SSA
+                ssa_perturb_prob: float,                        # Nominal probability for removing an SSA
                 data_save_freq: int,                            # Save data manager at this frequency of generated scenarios
                 num_difficult_scenarios_to_plot: int,           # Number of most difficult scenarios to plot
-                scene_capture_settings: auto_scene_gen_msgs.SceneCaptureSettings,
-                scene_capture_request: str,
-                scene_capture_request_value,
+                # CGA params
+                cga_population_size: int,                       # Size of each population for the CGA method
+                cga_num_families_per_population: int,           # Number of families to use for creating new populations from. The top 2f scenarios are parents which are paired like so: (1,2), (3,4), (5,6), ...
+                cga_num_populations: int,                       # Number of populations to run CGA method for
+                cga_mutation_prob: float,                       # Probability that an individual attribute in the scenario desription is mutated to a new random value
+                # Scene capture
+                scene_capture_settings: auto_scene_gen_msgs.SceneCaptureSettings,   # The scene capture settings message to use
+                scene_capture_request: str,                     # The scene capture request, see SCR_* options above
+                scene_capture_request_value,                    # The value assoicated with the scene capture request
+                # Replay request
+                replay_request_rank_range: List,                # A list of two items, in non-decreasing order, indicating the range of the best scenarios to replay
+                replay_request_num_replays: int,                # The number of times to replay each scenario
                 ):
         super().__init__(**auto_scene_gen_client_dict)
         np.random.seed() # Pick new random seed each time we load
 
+        # BACRE params
         self.num_runs_per_scenario = num_runs_per_scenario
         self.num_base_env = num_base_env
         self.num_env_to_generate = num_env_to_generate
+        self.num_mutations = num_mutations
+        self.b_regret_uses_equivalent_x_errors = b_regret_uses_equivalent_x_errors
         self.initial_prob_editing_random_env = initial_prob_editing_random_env
         self.prob_editing_random_env = prob_editing_random_env
         self.upper_search_quantile = upper_search_quantile
@@ -547,6 +748,7 @@ class BACRE2DAstarTrav(AutoSceneGenClient):
         self.ssa_perturb_prob = ssa_perturb_prob
         
         self.data_save_freq = data_save_freq
+        self.num_difficult_scenarios_to_plot = num_difficult_scenarios_to_plot
 
         # Create main directories
         self.dirs = {}
@@ -557,7 +759,7 @@ class BACRE2DAstarTrav(AutoSceneGenClient):
         self.dirs["legends"] = os.path.join(self.main_dir, "figures", "legends")
         self.dirs["replay"] = os.path.join(self.main_dir, "replay")
         self.dirs["outer"] = os.path.abspath(os.path.join(self.main_dir, "..")) # Contains all experiments
-        self.dirs["outer_figures"] = os.path.join(self.dirs["outer"], 'figures')
+        self.dirs["group_summary"] = os.path.join(self.dirs["outer"], "summary")
         for _,dir in self.dirs.items():
             os.makedirs(dir, exist_ok = True)
 
@@ -570,25 +772,42 @@ class BACRE2DAstarTrav(AutoSceneGenClient):
 
         self.max_regret_achieved = -math.inf
 
-        # Replay mode variables
-        self.replay_request = replay_request
-        self.num_replay_scenarios_completed = 0
-        self.num_replay_scenarios_not_started = 0 # Filled in when processing replay request
-        self.replay_worker_scenario_idx = {} # The index that the worker's scenario corresponds to in the replay_scenarios list
-        self.replay_scenarios : List[Scenario] = []
+        # Mode-specific processing ID (mspid) variables
+        self.worker_mspids : Dict[int, int] = {} # Key = worker ID, Value = an mspid
+        self.mspids : List[int] = [] # List of mspids that need to be run (gets set once)
+        self.mspids_completed : List[int] = [] # List of all completed mspids (new mspids get added to this)
+
+        # CGA variables
+        # NOTE: mspids are the scenario temp IDs to run for the current CGA population
+        self.cga_population_size = cga_population_size
+        self.cga_num_families_per_population = cga_num_families_per_population
+        self.cga_num_populations = cga_num_populations
+        self.cga_mutation_prob = cga_mutation_prob
+        self.cga_temp_save_dir = os.path.join(self.main_dir, "data", "cga_temp")
+        os.makedirs(self.cga_temp_save_dir, exist_ok = True)
+        self.cga_population_manager_filepath = os.path.join(self.main_dir, "data", "cga_population_manager.pkl")
+        self.cga_population_manager, b_loaded = self.load_cga_population_manager(self.cga_population_manager_filepath)
+        if b_loaded:
+            self.log("info", f"Loaded CGA population manager from: {self.cga_population_manager_filepath}")
+        else:
+            self.log("info", f"Could not load CGA population manager. Creating one from scratch.")
+        self.cga_population_idxs = [] # Scenario IDs for the current population
+        self.cga_parent_ids = [] # List of tuples denoting the parent combinations for this population (no need to rerun these scenarios)
 
         # Scene capture mode variables
+        # NOTE: mspids are the scenario IDs to use for scene capture
         self.scene_capture_settings = scene_capture_settings
         self.scene_capture_request = scene_capture_request
         self.scene_capture_request_value = scene_capture_request_value
-        self.scene_capture_worker_idx : Dict[int, int] = {}
-        self.num_scene_captures_completed = 0
-        self.num_scene_captures_not_started = 0
+
+        # Replay mode variables
+        # NOTE: mspids are the scenario indeces within the self.replay_scenarios variable
+        self.replay_request_rank_range = replay_request_rank_range
+        self.replay_request_num_replays = replay_request_num_replays
+        self.replay_scenarios : List[Scenario] = []
 
         self.b_saved_scene_legends = False
         self.b_done_testing = False
-        self.num_difficult_scenarios_to_plot = num_difficult_scenarios_to_plot
-        self.worker_backups : Dict[int, ASGWorkerRef] = {}
 
         self.scenario_regret_manager_filepath = os.path.join(self.main_dir, "data", "scenario_regret_manager.pkl")
         self.scenario_regret_manager, b_loaded = self.load_scenario_regret_manager(self.scenario_regret_manager_filepath)
@@ -610,15 +829,14 @@ class BACRE2DAstarTrav(AutoSceneGenClient):
         # Mode of operation
         self.mode = {
             self.MODE_BACRE: False,
-            self.MODE_REPLAY: False,
-            self.MODE_REPLAY_FROM_DIR: False,
             self.MODE_RANDOM: False,
+            self.MODE_CGA: False,
             self.MODE_ANALYSIS: False,
             self.MODE_ANALYSIS_PLOT: False,
             self.MODE_ANALYSIS_REPLAY: False,
             self.MODE_SCENE_CAPTURE: False,
+            self.MODE_REPLAY: False,
         }
-        self.replay_from_dir_suffix = "" # Capture the suffix of the relative path provided in the replay_from_dir option
         self.b_in_testing_mode = False
 
         mode = str.lower(mode)
@@ -641,16 +859,6 @@ class BACRE2DAstarTrav(AutoSceneGenClient):
             self.plot_scenario_rankings()
             self.plot_max_regret_scene()
         
-        elif mode == self.MODE_REPLAY:
-            self.mode[self.MODE_REPLAY] = True
-            self.process_replay_request()
-        
-        # Replay from specifiied directory
-        elif mode == self.MODE_REPLAY_FROM_DIR:
-            self.mode[self.MODE_REPLAY] = True
-            self.mode[self.MODE_REPLAY_FROM_DIR] = True
-            self.process_replay_request()
-            
         elif mode == self.MODE_RANDOM:
             self.mode[self.MODE_RANDOM] = True
             self.b_in_testing_mode = True
@@ -661,6 +869,19 @@ class BACRE2DAstarTrav(AutoSceneGenClient):
             self.plot_scenario_rankings()
             self.plot_max_regret_scene()
 
+        elif mode == self.MODE_CGA:
+            self.mode[self.MODE_CGA] = True
+            self.b_in_testing_mode = True
+            
+            self.log("info", f"Created {self.cga_population_manager.num_populations()} populations")
+            if self.cga_population_manager.num_populations() >= self.cga_num_populations:
+                self.mode[self.MODE_CGA] = False
+                self.b_in_testing_mode = False
+                self.log("info", f"Done creating CGA populations.")
+
+            self.plot_scenario_rankings()
+            self.plot_max_regret_scene()
+                
         elif mode == self.MODE_ANALYSIS:
             self.generated_scenarios : Dict[int, Scenario] = self.load_generated_scenarios(self.dirs["scenarios"], self.scenario_regret_manager)
             self.plot_scenario_rankings()
@@ -679,11 +900,28 @@ class BACRE2DAstarTrav(AutoSceneGenClient):
             self.mode[self.MODE_SCENE_CAPTURE] = True
             self.process_scene_capture_request()
 
+        elif mode == self.MODE_REPLAY:
+            self.mode[self.MODE_REPLAY] = True
+            self.process_replay_request()
+
         else:
             raise ValueError(f"Unrecognized mode of operation '{mode}'")
 
         self.log("info", "Initialized BACRE 2D")
         self.log("info", "-" * 60, b_log_ros=False)
+
+    def num_mspids_remaining(self):
+        """Return the number of mode-specific pids that have not been processed yet"""
+        return len(self.mspids) - len(self.mspids_completed) - len(self.worker_mspids)
+
+    def get_next_mspid(self):
+        """Return the next mode-specific pid for use"""
+        if self.num_mspids_remaining() == 0:
+            return None
+        
+        for id in self.mspids:
+            if id not in self.mspids_completed and id not in list(self.worker_mspids.values()):
+                return id
 
     def load_scenario_regret_manager(self, file_path: str):
         """Load scenario regret manager from file, if it exists.
@@ -708,6 +946,39 @@ class BACRE2DAstarTrav(AutoSceneGenClient):
         with open(self.scenario_regret_manager_filepath, 'wb') as f:
             pickle.dump(self.scenario_regret_manager, f, pickle.HIGHEST_PROTOCOL)
         self.log("info", f"Saved scenario regret manager to file: {self.scenario_regret_manager_filepath}")
+
+    def load_cga_population_manager(self, file_path: str):
+        """Load CGA population manager from file, if it exists.
+        
+        Args:
+            - file_path: File to laod data manager from
+
+        Returns:
+            - CGA population manager
+            - Bool indicating if load was successful
+        """
+        manager = CGAPopulationManager()
+        b_loaded = False
+        if os.path.exists(file_path):
+            with open(file_path, 'rb') as f:
+                manager : CGAPopulationManager = pickle.load(f)
+            b_loaded = True
+        return manager, b_loaded
+
+    def save_cga_population_manager(self):
+        """Save the internal CGA population manager"""
+        with open(self.cga_population_manager_filepath, 'wb') as f:
+            pickle.dump(self.cga_population_manager, f, pickle.HIGHEST_PROTOCOL)
+        self.log("info", f"Saved CGA population manager to file: {self.cga_population_manager_filepath}")
+
+    def load_cga_temp_scenario(self, temp_id: int):
+        """Load a scenario from teh CGA temp directory with the given temp ID"""
+        scenario = None
+        file_path = os.path.join(self.cga_temp_save_dir, f"scenario_temp_{temp_id}.pkl")
+        if os.path.exists(file_path):
+            with open(file_path, 'rb') as f:
+                scenario : Scenario = pickle.load(f)
+        return scenario
 
     def load_scenario_analysis(self, file_path: str):
         """Load scenario analysis from file, if it exists.
@@ -737,14 +1008,10 @@ class BACRE2DAstarTrav(AutoSceneGenClient):
             self.log("error", f"Cannot save scenario with ID None.")
             return
         
-        if self.mode[self.MODE_BACRE] or self.mode[self.MODE_RANDOM]:
-            file_path = os.path.join(self.dirs["scenarios"], f"scenario_{scenario.id}.pkl")
-            with open(file_path, 'wb') as f:
-                pickle.dump(scenario, f, pickle.HIGHEST_PROTOCOL)
-            self.log("info", f"Saved scenario with ID {scenario.id} to file: {file_path}")
-        else:
-            self.log("warn", f"Can only save scenario with this function in mode '{self.MODE_BACRE}' or '{self.MODE_RANDOM}'.")
-            return
+        file_path = os.path.join(self.dirs["scenarios"], f"scenario_{scenario.id}.pkl")
+        with open(file_path, 'wb') as f:
+            pickle.dump(scenario, f, pickle.HIGHEST_PROTOCOL)
+        self.log("info", f"Saved scenario with ID {scenario.id} to file: {file_path}")
 
     def load_generated_scenarios(self, scenario_dir: str, scenario_regret_manager: ScenarioRegretManager):
         """Load all data scenarios from the given directory. 
@@ -810,36 +1077,15 @@ class BACRE2DAstarTrav(AutoSceneGenClient):
         If you want to replay scenarios from a different experiment (with the same parameters), add a 'dir' key with the relative path to that desired experiment directory.
         Do not add the 'data' substring to that path as this function will take care of that. 
         """
-        if 'request' not in self.replay_request.keys():
-            raise ValueError(f"Replay Request: 'replay_request' dict must have key 'request'")
-
-        if 'num_replays' not in self.replay_request.keys():
-            raise ValueError(f"Replay Request: 'replay_request' dict must have key 'num_replays'")
-
         self.replay_scenarios.clear()
-        self.num_replays_per_scenario = self.replay_request['num_replays']
+        self.num_replays_per_scenario = self.replay_request_num_replays
 
-        # Get data manager
-        if self.mode[self.MODE_REPLAY_FROM_DIR]:
-            if 'dir' not in self.replay_request.keys():
-                raise ValueError(f"Replay Request: 'replay_request' dict must have key 'dir' to indicate which relative directory to load training scenarios from")
+        self.worker_mspids.clear()
+        self.mspids.clear()
+        self.mspids_completed.clear()
 
-            scenario_regret_manager_file = os.path.abspath(os.path.join(self.main_dir, self.replay_request['dir'], 'data/scenario_regret_manager.pkl'))
-            scenario_regret_manager, b_loaded = self.load_scenario_regret_manager(scenario_regret_manager_file)
-
-            if not b_loaded:
-                raise ValueError(f"Replay Request: Could not find/load scenario regret manager from {scenario_regret_manager_file}. Verify relative path specified with the 'dir' key.")
-            
-            if scenario_regret_manager.num_scenarios()  == 0:
-                raise ValueError(f"Replay Request: Loaded scenario regret manager has no scenarios.")
-
-            self.replay_from_dir_suffix = self.replay_request['dir'].split("../")[-1]
-
-            # generated_scenarios = self.load_generated_scenarios(os.path.abspath(os.path.join(self.main_dir, self.replay_request['dir'], "data", "scenarios")), scenario_regret_manager)
-            scenario_dir = os.path.abspath(os.path.join(self.main_dir, self.replay_request['dir'], "data", "scenarios"))
-        else:
-            scenario_regret_manager = self.scenario_regret_manager
-            scenario_dir = self.dirs["scenarios"]
+        scenario_regret_manager = self.scenario_regret_manager
+        scenario_dir = self.dirs["scenarios"]
 
         if scenario_regret_manager.num_scenarios() == 0:
             self.log("warn", f"Cannot use replay mode because there are no scenarios to replay.")
@@ -847,42 +1093,44 @@ class BACRE2DAstarTrav(AutoSceneGenClient):
             return
 
         # Replay rank range
-        if self.replay_request['request'] == str.lower('rankings'):
-            self.log("info", f"Processing replay request: rankings")
-            rank_range = self.replay_request['rank_range']
+        self.log("info", f"Processing replay request for rank range")
+        rank_range = self.replay_request_rank_range
 
-            if rank_range[0] > rank_range [1]:
-                raise ValueError(f"Replay Request: Invalid range of rankings {rank_range}. {rank_range[0]} is not <= {rank_range[1]}.")
-            
-            if rank_range[0] < 1 or rank_range[1] > scenario_regret_manager.num_scenarios():
-                raise ValueError(f"Replay Request: Invalid range of rankings {rank_range}. Valid numbers are integers from 1 to {scenario_regret_manager.num_scenarios()}.")
-                        
-            generated_scenarios : Dict[int, Scenario] = {}
-            replay_pairs = scenario_regret_manager.sorted_regrets[rank_range[0]-1:rank_range[1]]
-            try:
-                for id, regret in replay_pairs:
-                    self.load_generated_scenario_from_id(id, scenario_dir, scenario_regret_manager, generated_scenarios)
-                    self.replay_scenarios.append(generated_scenarios[id])
-            except Exception:
-                self.log("warn", f"Exception when loading scenario IDs: {traceback.format_exc()}")
-                self.mode[self.MODE_REPLAY] = False
-                return
-            self.replay_rankings = list(range(rank_range[0], rank_range[1]+1))
+        if rank_range[0] > rank_range [1]:
+            raise ValueError(f"Replay Request: Invalid range of rankings {rank_range}. {rank_range[0]} is not <= {rank_range[1]}.")
         
-        else:
-            raise ValueError(f"Unrecognized replay request '{self.replay_request['request']}'")
+        if rank_range[0] < 1 or rank_range[1] > scenario_regret_manager.num_scenarios():
+            raise ValueError(f"Replay Request: Invalid range of rankings {rank_range}. Valid numbers are integers from 1 to {scenario_regret_manager.num_scenarios()}.")
+                    
+        generated_scenarios : Dict[int, Scenario] = {}
+        replay_pairs = scenario_regret_manager.sorted_regrets[rank_range[0]-1:rank_range[1]]
+        try:
+            for id, regret in replay_pairs:
+                self.load_generated_scenario_from_id(id, scenario_dir, scenario_regret_manager, generated_scenarios)
+                self.replay_scenarios.append(generated_scenarios[id])
+        except Exception:
+            self.log("warn", f"Exception when loading scenario IDs: {traceback.format_exc()}")
+            self.mode[self.MODE_REPLAY] = False
+            return
+        self.replay_rankings = list(range(rank_range[0], rank_range[1]+1))
 
-        self.num_replay_scenarios_not_started = len(self.replay_scenarios)
+        self.mspids = np.arange(len(self.replay_scenarios)).tolist() # Scenario indeces within the self.replay_scenarios variable
+        self.log("info", f"Number of scenarios to replay: {len(self.mspids)}")
 
     def process_scene_capture_request(self):
         """Process the scene capture request so we can capture the desired scene images"""
         self.log("info", f"Processing scene capture request: {self.scene_capture_request}")
         val = self.scene_capture_request_value
+        scene_capture_scenario_ids = []
+
+        self.worker_mspids.clear()
+        self.mspids.clear()
+        self.mspids_completed.clear()
 
         if self.scene_capture_request == self.SCR_ID:
             if isinstance(val, int):
                 if 0 <= val < self.scenario_regret_manager.num_scenarios():
-                    self.scene_capture_scenario_ids = [val]
+                    scene_capture_scenario_ids = [val]
                 else:
                     raise ValueError(f"Scene capture request '{self.SCR_ID}': Scenario ID {val} does not exist. Choose from 0 to {self.scenario_regret_manager.num_scenarios()-1}.")
             
@@ -890,13 +1138,13 @@ class BACRE2DAstarTrav(AutoSceneGenClient):
                 if len(val) != 2:
                     raise ValueError(f"Scene capture request '{self.SCR_ID}': tuple/list must have two nonnegative integers in it.")
                 if 0 <= val[0] <= val[1] and val[1] < self.scenario_regret_manager.num_scenarios():
-                    self.scene_capture_scenario_ids = list(range(val[0], val[1]+1))
+                    scene_capture_scenario_ids = list(range(val[0], val[1]+1))
                 else:
                     raise ValueError(f"Scene capture request '{self.SCR_ID}': Tuple/list must be of the form (start_id, stop_id), with 0 <= start_id <= stop_id < {self.scenario_regret_manager.num_scenarios()}.")
             
             elif isinstance(val, str):
                 if val.lower() == "all":
-                    self.scene_capture_scenario_ids = list(range(0, self.scenario_regret_manager.num_scenarios()))
+                    scene_capture_scenario_ids = list(range(0, self.scenario_regret_manager.num_scenarios()))
                 else:
                     raise ValueError(f"Scene capture request '{self.SCR_ID}': Unrecognized string value '{val}'")
 
@@ -906,10 +1154,10 @@ class BACRE2DAstarTrav(AutoSceneGenClient):
         elif self.scene_capture_request == self.SCR_BEST:
             if isinstance(val, int):
                 if 0 < val <= self.scenario_regret_manager.num_scenarios():
-                    self.scene_capture_scenario_ids = []
+                    scene_capture_scenario_ids = []
                     for i in range(val):
                         id, _ = self.scenario_regret_manager.sorted_regrets[i]
-                        self.scene_capture_scenario_ids.append(id)
+                        scene_capture_scenario_ids.append(id)
                 else:
                     raise ValueError(f"Scene capture request '{self.SCR_BEST}': Integer value must be in the range [1, {self.scenario_regret_manager.num_scenarios()}].")
             else:
@@ -918,16 +1166,16 @@ class BACRE2DAstarTrav(AutoSceneGenClient):
         elif self.scene_capture_request == self.SCR_BEST_FAMILY_TREE:
             if isinstance(val, int):
                 if 0 < val <= self.scenario_regret_manager.num_scenarios():
-                    self.scene_capture_scenario_ids = []
+                    scene_capture_scenario_ids = []
                     for i in range(val):
                         id, _ = self.scenario_regret_manager.sorted_regrets[i]
-                        if id not in self.scene_capture_scenario_ids:
-                            self.scene_capture_scenario_ids.append(id)
+                        if id not in scene_capture_scenario_ids:
+                            scene_capture_scenario_ids.append(id)
 
                         parent_id = self.get_generated_scenario_from_id(id).parent_id
-                        while parent_id is not None:
-                            if parent_id not in self.scene_capture_scenario_ids:
-                                self.scene_capture_scenario_ids.append(parent_id)
+                        while parent_id is not None and isinstance(parent_id, int): # TODO: Account for parent ID being a tuple (for CGA)
+                            if parent_id not in scene_capture_scenario_ids:
+                                scene_capture_scenario_ids.append(parent_id)
                             parent = self.get_generated_scenario_from_id(parent_id)
                             parent_id = parent.parent_id
                 else:
@@ -938,7 +1186,8 @@ class BACRE2DAstarTrav(AutoSceneGenClient):
         else:
             raise ValueError(f"Scene capture request: Unrecognized request type '{self.scene_capture_request}'.")
         
-        self.num_scene_captures_not_started = len(self.scene_capture_scenario_ids)
+        self.mspids = scene_capture_scenario_ids # The actual scenario IDs for scene capture
+        self.log("info", f"Number of scenarios to recreate for scene capture: {len(self.mspids)}")
 
     def plot_scenario_rankings(self):
         """Plot the regret of all scenarios in decreasing order"""
@@ -1032,9 +1281,12 @@ class BACRE2DAstarTrav(AutoSceneGenClient):
         fig.clf()
 
         # Plot regret vs number of scenarios
+        # fontsize2 = 16
+        # legend_fontsize2 = 16
         fig, ax = plt.subplots(num=10)
         ax.axvline(self.num_base_env, linewidth=1, color="red", label="Num. Base Scenarios")
-        ax.plot(rankings, smoothed_regret_over_time, linewidth=1, color="blue", label=f"Regret") # f"Regret (Mvg. Avg. Window L={mvg_avg_window})"
+        if self.cga_population_manager.num_populations() == 0:
+            ax.plot(rankings, smoothed_regret_over_time, linewidth=1, color="blue", label=f"Regret") # f"Regret (Mvg. Avg. Window L={mvg_avg_window})"
         ax.plot(rankings, max_regret_over_time, linewidth=1, color="black", label="Max Regret")
         ax.set_xlabel(f"Iterations", fontsize=fontsize)
         ax.set_ylabel("Regret", fontsize=fontsize)
@@ -1050,12 +1302,36 @@ class BACRE2DAstarTrav(AutoSceneGenClient):
 
         ax.set_visible(False)
         fig.legend(fontsize=legend_fontsize)
-        fig.savefig(os.path.join(self.dirs["legends"], 'regret_vs_iterations_legend.pdf'), bbox_inches='tight')
-        fig.savefig(os.path.join(self.dirs["legends"], 'regret_vs_iterations_legend.png'), bbox_inches='tight')
-        # fig.savefig(os.path.join(self.dirs['figures'], 'regret_vs_num_scenarios.pdf'), bbox_extra_artists=(legend,), bbox_inches='tight')
+        fig.savefig(os.path.join(self.dirs["legends"], 'regret_vs_iterations_legend.pdf'), bbox_inches="tight")
+        fig.savefig(os.path.join(self.dirs["legends"], 'regret_vs_iterations_legend.png'), bbox_inches="tight")
         fig.clf()
 
-        if self.scenario_regret_manager.num_scenarios() >= 100:
+        # Plot regret vs. CGA populations
+        if self.cga_population_manager.num_populations() > 0:
+            fig, ax = plt.subplots(num=1)
+            pop_range = np.arange(self.cga_population_manager.num_populations()) + 1
+            ax.plot(pop_range, self.cga_population_manager.max_population_regret, linewidth=1, color="black", label="Max Regret")
+            ax.plot(pop_range, self.cga_population_manager.avg_population_regret, linewidth=1, color="blue", label="Avg. Regret")
+            ax.set_xlabel(f"Population", fontsize=fontsize)
+            ax.set_ylabel("Regret", fontsize=fontsize)
+            ax.tick_params(axis="both", which="major", labelsize=fontsize)
+
+            fig.tight_layout()
+            fig.savefig(os.path.join(self.dirs['figures'], 'regret_vs_cga_populations.pdf'), bbox_inches="tight")
+            fig.savefig(os.path.join(self.dirs['figures'], 'regret_vs_cga_populations.png'), bbox_inches="tight")
+
+            ax.legend(fontsize=legend_fontsize) # "lower right"
+            fig.tight_layout()
+            fig.savefig(os.path.join(self.dirs['figures'], 'regret_vs_cga_populations_wlegend.pdf'), bbox_inches="tight")
+            fig.savefig(os.path.join(self.dirs['figures'], 'regret_vs_cga_populations_wlegend.png'), bbox_inches="tight")
+
+            ax.set_visible(False)
+            fig.legend(fontsize=legend_fontsize)
+            fig.savefig(os.path.join(self.dirs["legends"], 'regret_vs_cga_populations_legend.pdf'), bbox_inches="tight")
+            fig.savefig(os.path.join(self.dirs["legends"], 'regret_vs_cga_populations_legend.png'), bbox_inches="tight")
+            fig.clf()
+
+        if self.scenario_regret_manager.num_scenarios() >= 100 and self.cga_population_manager.num_populations() == 0:
             # Plot curves showing the regret over the perturbations. Plot all the scenes from base scenario to final child.
             for num_best in (100,50,20):
                 fig, ax = plt.subplots(num=1)
@@ -1083,6 +1359,10 @@ class BACRE2DAstarTrav(AutoSceneGenClient):
         self.log("info", "Plotted scenario rankings")
 
     def plot_max_regret_scene(self):
+        if self.scenario_regret_manager.num_scenarios() == 0:
+            self.log("info", "No scenario data to plot from. Cannot plot max regret scene.")
+            return
+        
         best_scenario_id, _ = self.scenario_regret_manager.sorted_regrets[0]
         best_scenario = self.get_generated_scenario_from_id(best_scenario_id)
         self.max_regret_achieved = best_scenario.avg_regret.value
@@ -1145,20 +1425,21 @@ class BACRE2DAstarTrav(AutoSceneGenClient):
                 f.write(f"Rank {i+1} / ID {id} / Regret: {regret:.4f}")
 
             # Plot curves showing the regret over the perturbations. Plot all the scenes from base scenario to final child.
-            regrets_over_time = [scenario.avg_regret.value]
-            parent_id = scenario.parent_id
-            while parent_id is not None:
-                parent = self.get_generated_scenario_from_id(parent_id)
-                regrets_over_time.insert(0, parent.avg_regret.value)
-                parent_id = parent.parent_id
-            
-            fig, ax = plt.subplots(num=2)
-            ax.plot(np.arange(len(regrets_over_time)) + 1, regrets_over_time, linewidth=1, color="black")
-            ax.set_xlabel(f"Tree Level")
-            ax.set_ylabel(f"Regret")
-            fig.tight_layout()
-            plt.savefig(os.path.join(scene_plot_dir, f"scene_rank_{i+1:02d}_regret_vs_tree_level.pdf"))
-            plt.clf()
+            if self.cga_population_manager.num_populations() == 0:
+                regrets_over_time = [scenario.avg_regret.value]
+                parent_id = scenario.parent_id
+                while parent_id is not None:
+                    parent = self.get_generated_scenario_from_id(parent_id)
+                    regrets_over_time.insert(0, parent.avg_regret.value)
+                    parent_id = parent.parent_id
+                
+                fig, ax = plt.subplots(num=2)
+                ax.plot(np.arange(len(regrets_over_time)) + 1, regrets_over_time, linewidth=1, color="black")
+                ax.set_xlabel(f"Tree Level")
+                ax.set_ylabel(f"Regret")
+                fig.tight_layout()
+                plt.savefig(os.path.join(scene_plot_dir, f"scene_rank_{i+1:02d}_regret_vs_tree_level.pdf"))
+                plt.clf()
 
     def plot_scenario_tree(self, scenario: Scenario, scenario_name: str):
         """Plot the entire set of scenes from the scenario tree, from base scenario to final scenario
@@ -1167,8 +1448,8 @@ class BACRE2DAstarTrav(AutoSceneGenClient):
             - scenario: Scenario
             - scenario_name: Name for the scenario, used for plotting
         """
-        # self.log("info", f"Plotting scenario tree...")
-        # num_total_scenarios = scenario.tree_level + 1
+        if self.cga_population_manager.num_populations() > 0:
+            return
         
         # Collect all scenarios in the tree, with the index being the tree level
         scenario_tree : List[Scenario] = [scenario]
@@ -1177,56 +1458,6 @@ class BACRE2DAstarTrav(AutoSceneGenClient):
             parent = self.get_generated_scenario_from_id(parent_id)
             scenario_tree.insert(0,parent)
             parent_id = parent.parent_id
-
-        # num_cols = 5
-        # max_cols = 8
-        # num_rows = math.ceil(num_total_scenarios / num_cols)
-        # while num_rows > num_cols and num_cols < max_cols:
-        #     num_cols += 1
-        #     num_rows -= 1
-        # if num_rows <= 3:
-        #     num_rows = 3 # Setting this to at least 3 wierdly helps prevent pyplot from adding too much vertical spacing
-        # fig, ax = plt.subplots(num_rows, num_cols, num=1)
-        # # ax : List[List[plt.Axes]]
-        # marker_scale = max([1/num_rows, 1/num_cols, 0.25])
-        # self.log("info", f"Num scenarios in tree = {num_total_scenarios}, plot rows = {num_rows}, plot cols = {num_cols}")
-
-        # fig_handles = []
-        # fig_labels = []
-        # ref_labelsize = 16
-        # for row in range(num_rows):
-        #     for col in range(num_cols):
-        #         idx = row*num_cols + col
-        #         if idx <= scenario.tree_level:
-        #             ax_title = f"Level {idx} (Iter {scenario_tree[idx].id + 1}):\nAvg. Regret {scenario_tree[idx].avg_regret.value:.2f}"
-        #             # if num_rows == 1:
-        #             #     self.plot_scene_on_axis(ax[col], scenario_tree[idx], marker_scale, ref_labelsize)
-        #             #     ax[col].set_title(ax_title, fontsize=5)
-        #             #     handles, labels = ax[col].get_legend_handles_labels()
-        #             # else:
-        #             self.plot_scene_on_axis(ax[row,col], scenario_tree[idx], marker_scale, ref_labelsize)
-        #             title_fontsize = min([5, ref_labelsize*marker_scale])
-        #             ax[row,col].set_title(ax_title, fontsize=title_fontsize)
-        #             handles, labels = ax[row,col].get_legend_handles_labels()
-
-        #             for handle,label in zip(handles, labels):
-        #                 if label not in fig_labels:
-        #                     fig_handles.append(handle)
-        #                     fig_labels.append(label)
-        #         else:
-        #             # if num_rows == 1:
-        #             #     ax[col].set_visible(False)
-        #             # else:
-        #             ax[row,col].set_visible(False)
-
-        # fig.tight_layout(pad=0.5, w_pad=0.5, h_pad=0.5) # v2
-        # # fig.tight_layout(pad=0.5) # v1
-        # # fig.subplots_adjust(hspace=None, wspace=0.4) # v3
-        # # fig.subplots_adjust(top=0.85)
-        # fig.legend(fig_handles, fig_labels, loc='lower center', ncol=8, bbox_to_anchor=(.5, 1), fontsize=5)
-        # file_name = os.path.join(self.dirs['figures'], f"{scenario_name}_tree.pdf")
-        # fig.savefig(file_name, bbox_inches='tight')
-        # fig.clf()
 
         save_dir = os.path.join(self.dirs["figures"], f"{scenario_name}_tree")
         if os.path.isdir(save_dir):
@@ -1430,7 +1661,7 @@ class BACRE2DAstarTrav(AutoSceneGenClient):
             pickle.dump(self.scenario_analysis, f, pickle.HIGHEST_PROTOCOL)
         self.log("info", f"Saved scenario analysis to: {self.scenario_analysis_filepath}")
 
-        self.plot_scenario_analysis()
+        # self.plot_scenario_analysis() # This takes too long, commenting out
 
     def plot_scenario_analysis(self):
         self.log("info", f"Plotting scenario analysis...")
@@ -1606,125 +1837,279 @@ class BACRE2DAstarTrav(AutoSceneGenClient):
 
                 self.analyze_replay_scenario(sd, scenario=None)
 
-    def plot_group_summary(self, group_summary_dict: Dict, figure_prefix: str):
+    def plot_group_summary(self, group_summary_dict: Dict, figure_prefix: str, num_legend_cols: int = 3, legend_fontsize: float = 12):
         self.log("info", "Making group summary plots...")
 
-        # Load all scenario regret managers in same structure as group names
-        group_managers = {}
+        # Load all scenario regret manager data in same structure as group names
         group_regrets = {}
         group_regrets_smoothed = {}
         group_max_regrets = {}
         for group_name, (folders,color) in group_summary_dict.items():
-            managers : List[ScenarioRegretManager] = []
             regrets = []
             regrets_smoothed = []
             max_regrets = []
             for name in folders:
+                self.log("info", f"Loading scenario regret manager from folder {name}")
                 srm_path = os.path.join(self.dirs["outer"], name, "data", "scenario_regret_manager.pkl")
                 srm, loaded = self.load_scenario_regret_manager(srm_path)
                 if loaded:
-                    managers.append(srm)
                     regrets.append(list(srm.scenario_regrets.values()))
                     regrets_smoothed.append(get_smoothing_avg(list(srm.scenario_regrets.values()), 100))
                     max_regrets.append(np.array(srm.max_regret_over_time)[:,1])
                 else:
                     raise ValueError(f"Could not load scenario regret manager from path: {srm_path}")
-            group_managers[group_name] = managers
             group_regrets[group_name] = np.array(regrets)
             group_regrets_smoothed[group_name] = np.array(regrets_smoothed)
             group_max_regrets[group_name] = np.array(max_regrets)
 
-        # Plot scenario rankings
-        # fig1, ax1 = plt.subplots(num=1)
-        # ax1.set_xlabel(f"Scenario Ranking Index")
-        # ax1.set_ylabel(f"Regret")
-        # fig2, ax2 = plt.subplots(num=2)
-        # ax2.set_xlabel(f"Scenario Ranking Index")
-        # ax2.set_ylabel(f"Regret")
-
         fontsize = 12
-        legend_fontsize = 12
+        # legend_fontsize = 12
 
+        # Regret vs. Iterations
         fig, ax = plt.subplots(num=1)
         ax.set_xlabel(f"Iterations", fontsize=fontsize)
         ax.set_ylabel(f"Regret", fontsize=fontsize)
         ax.tick_params(axis="both", which="major", labelsize=fontsize)
-        ax.axvline(self.num_base_env, linewidth=1, color="black", label="Num. Base Scenarios")
+        ax.axvline(self.num_base_env, linestyle='--', linewidth=1, color="black", label="Num. Base\nScenarios")
         if self.anneal_duration > 0:
-            ax.axvline(self.anneal_duration + self.num_base_env, linewidth=1, color="magenta", label="Annealing Ends")
+            ax.axvline(self.anneal_duration + self.num_base_env, linestyle='--', linewidth=1, color="magenta", label="Annealing Ends")
 
+        # Max Regret vs. Iterations
         fig2, ax2 = plt.subplots(num=2)
         ax2.set_xlabel(f"Iterations", fontsize=fontsize)
         ax2.set_ylabel(f"Max Regret", fontsize=fontsize)
         ax2.tick_params(axis="both", which="major", labelsize=fontsize)
-        ax2.axvline(self.num_base_env, linewidth=1, color="black", label="Num. Base Scenarios")
+        ax2.axvline(self.num_base_env, linestyle='--', linewidth=1, color="black", label="Num. Base\nScenarios")
         if self.anneal_duration > 0:
-            ax2.axvline(self.anneal_duration + self.num_base_env, linewidth=1, color="magenta", label="Annealing Ends")
+            ax2.axvline(self.anneal_duration + self.num_base_env, linestyle='--', linewidth=1, color="magenta", label="Annealing Ends")
 
+        # Side-by-Side (w/ standard error)
         ar3 = 16/9
         width3 = 6.4
         fig3, ax3 = plt.subplots(ncols=2,num=3, figsize=(width3, width3/ar3))
         ax3[0].set_xlabel(f"Iterations", fontsize=fontsize)
         ax3[0].set_ylabel(f"Regret", fontsize=fontsize)
         ax3[0].tick_params(axis="both", which="major", labelsize=fontsize)
-        ax3[0].axvline(self.num_base_env, linewidth=1, color="black", label="Num. Base Scenarios")
+        ax3[0].axvline(self.num_base_env, linestyle='--', linewidth=1, color="black", label="Num. Base\nScenarios")
         
         ax3[1].set_xlabel(f"Iterations", fontsize=fontsize)
         ax3[1].set_ylabel(f"Max Regret", fontsize=fontsize)
         ax3[1].tick_params(axis="both", which="major", labelsize=fontsize)
-        ax3[1].axvline(self.num_base_env, linewidth=1, color="black", label="Num. Base Scenarios")
+        ax3[1].axvline(self.num_base_env, linestyle='--', linewidth=1, color="black", label="Num. Base\nScenarios")
         if self.anneal_duration > 0:
-            ax3[0].axvline(self.anneal_duration + self.num_base_env, linewidth=1, color="magenta", label="Annealing Ends")
-            ax3[1].axvline(self.anneal_duration + self.num_base_env, linewidth=1, color="magenta", label="Annealing Ends")
+            ax3[0].axvline(self.anneal_duration + self.num_base_env, linestyle='--', linewidth=1, color="magenta", label="Annealing Ends")
+            ax3[1].axvline(self.anneal_duration + self.num_base_env, linestyle='--', linewidth=1, color="magenta", label="Annealing Ends")
+        
+        # Side-by-Side (avg. only, no std. error)
+        fig4, ax4 = plt.subplots(ncols=2,num=4, figsize=(width3, width3/ar3))
+        ax4[0].set_xlabel(f"Iterations", fontsize=fontsize)
+        ax4[0].set_ylabel(f"Regret", fontsize=fontsize)
+        ax4[0].tick_params(axis="both", which="major", labelsize=fontsize)
+        ax4[0].axvline(self.num_base_env, linestyle='--', linewidth=1, color="black", label="Num. Base\nScenarios")
+        
+        ax4[1].set_xlabel(f"Iterations", fontsize=fontsize)
+        ax4[1].set_ylabel(f"Max Regret", fontsize=fontsize)
+        ax4[1].tick_params(axis="both", which="major", labelsize=fontsize)
+        ax4[1].axvline(self.num_base_env, linestyle='--', linewidth=1, color="black", label="Num. Base\nScenarios")
+        if self.anneal_duration > 0:
+            ax4[0].axvline(self.anneal_duration + self.num_base_env, linestyle='--', linewidth=1, color="magenta", label="Annealing Ends")
+            ax4[1].axvline(self.anneal_duration + self.num_base_env, linestyle='--', linewidth=1, color="magenta", label="Annealing Ends")
 
         xrange = 1+np.arange(self.num_env_to_generate)
-        for group_name, managers in group_managers.items():
+        for group_name in group_summary_dict.keys():
             group_color = group_summary_dict[group_name][-1]
 
             iter_mean = np.mean(group_regrets_smoothed[group_name], axis=0)
             iter_std = np.std(group_regrets_smoothed[group_name], axis=0)
             max_mean = np.mean(group_max_regrets[group_name], axis=0)
             max_std = np.std(group_max_regrets[group_name], axis=0)
-            z = 1. # 1.96 for 95% CI
+            z = 1. # 1.96 for 95% CI, 1 for std error
 
             ax.fill_between(xrange, iter_mean - z*iter_std, iter_mean + z*iter_std, edgecolor=group_color, facecolor=group_color, alpha=0.2)
             ax.plot(xrange, iter_mean, linewidth=1, color=group_color, label=group_name)
             ax3[0].fill_between(xrange, iter_mean - z*iter_std, iter_mean + z*iter_std, edgecolor=group_color, facecolor=group_color, alpha=0.2)
             ax3[0].plot(xrange, iter_mean, linewidth=1, color=group_color, label=group_name)
+            ax4[0].plot(xrange, iter_mean, linewidth=1, color=group_color, label=group_name)
             
             ax2.fill_between(xrange, max_mean - z*max_std, max_mean + z*max_std, edgecolor=group_color, facecolor=group_color, alpha=0.2)
             ax2.plot(xrange, max_mean, linewidth=1, color=group_color, label=group_name)
             ax3[1].fill_between(xrange, max_mean - z*max_std, max_mean + z*max_std, edgecolor=group_color, facecolor=group_color, alpha=0.2)
             ax3[1].plot(xrange, max_mean, linewidth=1, color=group_color, label=group_name)
-
-            # Number of scenarios with regret above certain thresholds
-            threhsolds = (0.5, 0.75, 1.)
-            for t in threhsolds:
-                num = np.count_nonzero(group_regrets[group_name] >= t)
-                self.log("info", f"Group {group_name}: Fraction of scenarios with regret >= {t:.4f}: {num}/{group_regrets[group_name].size} = {num/group_regrets[group_name].size:.4f}")
+            ax4[1].plot(xrange, max_mean, linewidth=1, color=group_color, label=group_name)
 
         handles, labels = ax.get_legend_handles_labels()
-        # ax.legend(fontsize=legend_fontsize) # "lower right"
+
         fig.tight_layout(pad=0.5)
-        fig.legend(handles, labels, loc='lower center', ncol=2, bbox_to_anchor=(.5, 1), fontsize=legend_fontsize)
-        fig.savefig(os.path.join(self.dirs['outer_figures'], f"{figure_prefix}_regret_vs_iterations.pdf"), bbox_inches='tight')
+        fig.legend(handles, labels, loc='lower center', ncol=num_legend_cols, bbox_to_anchor=(.5, 1), fontsize=legend_fontsize)
+        fig.savefig(os.path.join(self.dirs["group_summary"], f"{figure_prefix}_regret_vs_iterations.pdf"), bbox_inches="tight")
+        fig.savefig(os.path.join(self.dirs["group_summary"], f"{figure_prefix}_regret_vs_iterations.png"), bbox_inches="tight")
         
-        # ax2.legend(loc = "lower right", fontsize=legend_fontsize) # "lower right"
         fig2.tight_layout(pad=0.5)
-        fig2.legend(handles, labels, loc='lower center', ncol=2, bbox_to_anchor=(.5, 1), fontsize=legend_fontsize)
-        fig2.savefig(os.path.join(self.dirs['outer_figures'], f"{figure_prefix}_max_regret_vs_iterations.pdf"), bbox_inches='tight')
+        fig2.legend(handles, labels, loc='lower center', ncol=num_legend_cols, bbox_to_anchor=(.5, 1), fontsize=legend_fontsize)
+        fig2.savefig(os.path.join(self.dirs["group_summary"], f"{figure_prefix}_max_regret_vs_iterations.pdf"), bbox_inches="tight")
+        fig2.savefig(os.path.join(self.dirs["group_summary"], f"{figure_prefix}_max_regret_vs_iterations.png"), bbox_inches="tight")
         
         fig3.tight_layout()
-        fig3.legend(handles, labels, loc='lower center', ncol=3, bbox_to_anchor=(.5, 1.), fontsize=legend_fontsize)
-        fig3.savefig(os.path.join(self.dirs['outer_figures'], f"{figure_prefix}_side_by_side_regret_vs_iterations.pdf"), bbox_inches='tight')
-        # fig3.savefig(os.path.join(self.dirs['outer_figures'], f"{figure_prefix}_side_by_side_regret_vs_iterations.pdf"), bbox_extra_artists=(legend3,), bbox_inches='tight')
+        fig3.legend(handles, labels, loc='lower center', ncol=num_legend_cols, bbox_to_anchor=(.5, 1.), fontsize=legend_fontsize)
+        fig3.savefig(os.path.join(self.dirs["group_summary"], f"{figure_prefix}_side_by_side_regret_vs_iterations.pdf"), bbox_inches="tight")
+        fig3.savefig(os.path.join(self.dirs["group_summary"], f"{figure_prefix}_side_by_side_regret_vs_iterations.png"), bbox_inches="tight")
+        # fig3.savefig(os.path.join(self.dirs["group_summary"], f"{figure_prefix}_side_by_side_regret_vs_iterations.pdf"), bbox_extra_artists=(legend3,), bbox_inches="tight")
+        
+        fig4.tight_layout()
+        fig4.legend(handles, labels, loc='lower center', ncol=num_legend_cols, bbox_to_anchor=(.5, 1.), fontsize=legend_fontsize)
+        fig4.savefig(os.path.join(self.dirs["group_summary"], f"{figure_prefix}_side_by_side_regret_vs_iterations_avg_only.pdf"), bbox_inches="tight")
+        fig4.savefig(os.path.join(self.dirs["group_summary"], f"{figure_prefix}_side_by_side_regret_vs_iterations_avg_only.png"), bbox_inches="tight")
+        # fig4.savefig(os.path.join(self.dirs["group_summary"], f"{figure_prefix}_side_by_side_regret_vs_iterations.pdf"), bbox_extra_artists=(legend3,), bbox_inches="tight")
         
         fig.clf()
         fig2.clf()
         fig3.clf()
+        fig4.clf()
         plt.close(fig)
         plt.close(fig2)
         plt.close(fig3)
+        plt.close(fig4)
+
+    def plot_cga_group_summary(self, group_summary_dict: Dict):
+        self.log("info", "Making CGA group summary plots...")
+
+        # Load all CGA population manager data in same structure as group names
+        group_cga_regrets = {}
+        group_cga_max_regrets = {}
+        for group_name, (folders,color) in group_summary_dict.items():
+            regrets = []
+            max_regrets = []
+            for name in folders:
+                self.log("info", f"Loading CGA population manager from folder {name}")
+                cga_path = os.path.join(self.dirs["outer"], name, "data", "cga_population_manager.pkl")
+                cpm, loaded = self.load_cga_population_manager(cga_path)
+                if loaded:
+                    regrets.append(cpm.avg_population_regret)
+                    max_regrets.append(cpm.max_population_regret)
+                else:
+                    raise ValueError(f"Could not load CGA population manager from path: {cga_path}")
+            group_cga_regrets[group_name] = np.array(regrets)
+            group_cga_max_regrets[group_name] = np.array(max_regrets)
+
+        # Load all scenario regret manager data in same structure as group names
+        group_regrets = {}
+        for group_name, (folders,color) in group_summary_dict.items():
+            regrets = []
+            for name in folders:
+                self.log("info", f"Loading scenario regret manager from folder {name}")
+                srm_path = os.path.join(self.dirs["outer"], name, "data", "scenario_regret_manager.pkl")
+                srm, loaded = self.load_scenario_regret_manager(srm_path)
+                if loaded:
+                    regrets.append(list(srm.scenario_regrets.values()))
+                else:
+                    raise ValueError(f"Could not load scenario regret manager from path: {srm_path}")
+            group_regrets[group_name] = np.array(regrets)
+
+        fontsize = 12
+        legend_fontsize = 12
+
+        ar3 = 16/9
+        width3 = 6.4
+        fig3, ax3 = plt.subplots(ncols=2,num=3, figsize=(width3, width3/ar3))
+        ax3[0].set_xlabel(f"Population", fontsize=fontsize)
+        ax3[0].set_ylabel(f"Average Regret", fontsize=fontsize)
+        ax3[0].tick_params(axis="both", which="major", labelsize=fontsize)
+        
+        ax3[1].set_xlabel(f"Population", fontsize=fontsize)
+        ax3[1].set_ylabel(f"Max Regret", fontsize=fontsize)
+        ax3[1].tick_params(axis="both", which="major", labelsize=fontsize)
+
+        xrange = 1+np.arange(self.cga_num_populations)
+        for group_name in group_summary_dict.keys():
+            group_color = group_summary_dict[group_name][-1]
+
+            pop_mean = np.mean(group_cga_regrets[group_name], axis=0)
+            pop_std = np.std(group_cga_regrets[group_name], axis=0)
+            max_mean = np.mean(group_cga_max_regrets[group_name], axis=0)
+            max_std = np.std(group_cga_max_regrets[group_name], axis=0)
+            z = 1. # 1.96 for 95% CI, 1 for std error
+
+            ax3[0].fill_between(xrange, pop_mean - z*pop_std, pop_mean + z*pop_std, edgecolor=group_color, facecolor=group_color, alpha=0.2)
+            ax3[0].plot(xrange, pop_mean, linewidth=1, color=group_color, label=group_name)
+            
+            ax3[1].fill_between(xrange, max_mean - z*max_std, max_mean + z*max_std, edgecolor=group_color, facecolor=group_color, alpha=0.2)
+            ax3[1].plot(xrange, max_mean, linewidth=1, color=group_color, label=group_name)
+
+        handles, labels = ax3[0].get_legend_handles_labels()
+
+        fig3.tight_layout()
+        fig3.legend(handles, labels, loc='lower center', ncol=2, bbox_to_anchor=(.5, 1.), fontsize=legend_fontsize)
+        fig3.savefig(os.path.join(self.dirs["group_summary"], f"cga_side_by_side_regret_vs_populations.pdf"), bbox_inches="tight")
+        fig3.savefig(os.path.join(self.dirs["group_summary"], f"cga_side_by_side_regret_vs_populations.png"), bbox_inches="tight")
+
+        fig3.clf()
+        plt.close(fig3)
+
+    def group_summary_logging(self, group_summary_dict: Dict, regret_thresholds: Tuple[float], filename_prefix: str):
+        self.log("info", "Making group summary logs...")
+
+        # Load all scenario regret manager data in same structure as group names
+        group_regrets = {}
+        group_failure_rates = {}
+        for group_name, folders in group_summary_dict.items():
+            regrets = []
+            failure_rates = []
+            for name in folders:
+                self.log("info", f"Loading scenario regret manager from folder {name}")
+                srm_path = os.path.join(self.dirs["outer"], name, "data", "scenario_regret_manager.pkl")
+                srm, loaded = self.load_scenario_regret_manager(srm_path)
+                if loaded:
+                    regrets.append(list(srm.scenario_regrets.values()))
+                    failure_rates.append(list(srm.failure_rate.values()))
+                else:
+                    raise ValueError(f"Could not load scenario regret manager from path: {srm_path}")
+            group_regrets[group_name] = np.array(regrets)
+            group_failure_rates[group_name] = np.array(failure_rates)
+
+        regret_thresholds_file = os.path.join(self.dirs["group_summary"], f"{filename_prefix}_regret_thresholds_group_summary.txt")
+        with open(regret_thresholds_file, "w") as f:
+            f.write(f"Scenarios per group whose regret is >= to the following thresholds: {regret_thresholds}\n")
+
+        failure_rate_file = os.path.join(self.dirs["group_summary"], f"{filename_prefix}_failure_rate_group_summary.txt")
+        with open(failure_rate_file, "w") as f:
+            f.write(f"Fraction of scenario outcomes resulting in vehicle failure\n")
+
+        for group_name in group_summary_dict.keys():
+            with open(regret_thresholds_file, "a") as f:
+                f.write(f"{group_name}:\n")
+                n1,n2 = group_regrets[group_name].shape
+                f.write(f"\t- Scenario Count: {group_regrets[group_name].size} ({n1} Experiments with {n2} Scenarios Each)\n")
+
+            # Number of scenarios with regret above certain thresholds
+            for t in regret_thresholds:
+                exceed_threshold = group_regrets[group_name] >= t
+                count = np.count_nonzero(exceed_threshold)
+                fraction = count/group_regrets[group_name].size
+                
+                # Find how long it took to exceed each threshold
+                iters = []
+                for i in range(exceed_threshold.shape[0]):
+                    for j in range(exceed_threshold.shape[1]):
+                        if exceed_threshold[i,j]:
+                            iters.append(j+1)
+                            break
+                num_iters_to_exceed = np.mean(iters)
+
+                with open(regret_thresholds_file, "a") as f:
+                    f.write(f"\t- Threshold {t}: Count {count}, Fraction {fraction:.6f}, Num. Iters to Reach {num_iters_to_exceed:.1f} \n")
+
+            # Find maximum regret achieved
+            max_regrets = np.max(group_regrets[group_name],axis=-1)
+            arg_max = np.argmax(max_regrets)
+            max_folder = group_summary_dict[group_name][arg_max]
+            with open(regret_thresholds_file, "a") as f:
+                f.write(f"\t- Maximum Regret Achieved: {max_regrets[arg_max]:.6f} (Experiment Index {arg_max}, Folder \"{max_folder}\") \n")
+
+            # Vehicle failure rate
+            with open(failure_rate_file, "a") as f:
+                f.write(f"{group_name}:\n")
+                f.write(f"\t- Total Scenarios: {group_regrets[group_name].size}\n")
+                f.write(f"\t- Vehicle Failure Rate: {np.mean(group_failure_rates[group_name]):.6f}\n")
 
     def get_extreme_path_values(self, vehicle_paths: List[np.float32]):
         """Get the min/max x,y values from the list of vehicle paths
@@ -1936,7 +2321,7 @@ class BACRE2DAstarTrav(AutoSceneGenClient):
 
         Args:
             - scenario: The scenaio object with the scene description and the base AV path
-            - file_name_prefix: The base file path used for saving images. Do NOT include the extension (this will save both a .pdf and .svg file)
+            - file_name_prefix: The base file path used for saving images. Do NOT include the extension (this will save both a .pdf and .png file)
             - format: Applies for creating the scene capture mosaic (defaul) with a large orthographic aerial view and two smaller images (front aerial and vehicle starting POV). 
                         If "landscape", then the smaller images are placed on the right side of the large orthographic view. If "portrait", then they are placed above it.
             - title: (Optional) Title for the figure. If None, then this function will create one based on the parameters provided.
@@ -2015,13 +2400,12 @@ class BACRE2DAstarTrav(AutoSceneGenClient):
 
             fig.tight_layout(pad=0.5)
             fig.legend(handles, labels, loc='lower center', ncol=3, bbox_to_anchor=(.5, 1), fontsize=fontsize)
-            fig.savefig(file_name_prefix + "_pyplot.pdf", bbox_inches='tight')
+            fig.savefig(file_name_prefix + "_pyplot.pdf", bbox_inches="tight")
         else:
             fig.subplots_adjust(wspace=0., hspace=0.)
             if not b_add_legend:
-                fig.savefig(file_name_prefix + f"_figwidth{fig_width}.pdf", bbox_inches='tight', pad_inches=0.1*marker_scale)
-                # fig.savefig(file_name_prefix + ".svg", bbox_inches='tight', pad_inches=0.1*marker_scale, dpi=dpi)
-                fig.savefig(file_name_prefix + f"_figwidth{fig_width}.png", bbox_inches='tight', pad_inches=0.1*marker_scale, dpi=dpi)
+                fig.savefig(file_name_prefix + f"_figwidth{fig_width}.pdf", bbox_inches="tight", pad_inches=0.1*marker_scale)
+                fig.savefig(file_name_prefix + f"_figwidth{fig_width}.png", bbox_inches="tight", pad_inches=0.1*marker_scale, dpi=dpi)
 
                 # Add legend
                 if format == "landscape":
@@ -2031,9 +2415,8 @@ class BACRE2DAstarTrav(AutoSceneGenClient):
                 legend.get_frame().set_linewidth(0.8 * marker_scale)
                 legend.get_frame().set_facecolor(self.COLOR_LEGEND)
                 
-                fig.savefig(file_name_prefix + f"_wlegend_figwidth{fig_width}.pdf", bbox_inches='tight', pad_inches=0.1*marker_scale)
-                # fig.savefig(file_name_prefix + "_wlegend.svg", bbox_inches='tight', pad_inches=0.1*marker_scale, dpi=dpi)
-                fig.savefig(file_name_prefix + f"_wlegend_figwidth{fig_width}.png", bbox_inches='tight', pad_inches=0.1*marker_scale, dpi=dpi)
+                fig.savefig(file_name_prefix + f"_wlegend_figwidth{fig_width}.pdf", bbox_inches="tight", pad_inches=0.1*marker_scale)
+                fig.savefig(file_name_prefix + f"_wlegend_figwidth{fig_width}.png", bbox_inches="tight", pad_inches=0.1*marker_scale, dpi=dpi)
 
         fig.clf()
         plt.close(fig)
@@ -2065,8 +2448,8 @@ class BACRE2DAstarTrav(AutoSceneGenClient):
         legend.get_frame().set_linewidth(0.8 * marker_scale)
         legend.get_frame().set_facecolor(self.COLOR_LEGEND)
         fig.tight_layout(pad=0., w_pad=0., h_pad=0.)
-        fig.savefig(os.path.join(self.dirs["legends"], "scene_legend_base_3col.pdf"), bbox_inches='tight', pad_inches=0.1*marker_scale)
-        fig.savefig(os.path.join(self.dirs["legends"], "scene_legend_base_3col.png"), bbox_inches='tight', pad_inches=0.1*marker_scale)
+        fig.savefig(os.path.join(self.dirs["legends"], "scene_legend_base_3col.pdf"), bbox_inches="tight", pad_inches=0.1*marker_scale)
+        fig.savefig(os.path.join(self.dirs["legends"], "scene_legend_base_3col.png"), bbox_inches="tight", pad_inches=0.1*marker_scale)
         fig.clf()
 
         fig, ax = self._create_dummy_scene(marker_scale, False)
@@ -2076,8 +2459,8 @@ class BACRE2DAstarTrav(AutoSceneGenClient):
         legend.get_frame().set_linewidth(0.8 * marker_scale)
         legend.get_frame().set_facecolor(self.COLOR_LEGEND)
         fig.tight_layout(pad=0., w_pad=0., h_pad=0.)
-        fig.savefig(os.path.join(self.dirs["legends"], "scene_legend_base_1col.pdf"), bbox_inches='tight', pad_inches=0.1*marker_scale)
-        fig.savefig(os.path.join(self.dirs["legends"], "scene_legend_base_1col.png"), bbox_inches='tight', pad_inches=0.1*marker_scale)
+        fig.savefig(os.path.join(self.dirs["legends"], "scene_legend_base_1col.pdf"), bbox_inches="tight", pad_inches=0.1*marker_scale)
+        fig.savefig(os.path.join(self.dirs["legends"], "scene_legend_base_1col.png"), bbox_inches="tight", pad_inches=0.1*marker_scale)
         fig.clf()
 
         fig, ax = self._create_dummy_scene(marker_scale, False)
@@ -2087,8 +2470,8 @@ class BACRE2DAstarTrav(AutoSceneGenClient):
         legend.get_frame().set_linewidth(0.8 * marker_scale)
         legend.get_frame().set_facecolor(self.COLOR_LEGEND)
         fig.tight_layout(pad=0., w_pad=0., h_pad=0.)
-        fig.savefig(os.path.join(self.dirs["legends"], "scene_legend_base_1row.pdf"), bbox_inches='tight', pad_inches=0.1*marker_scale)
-        fig.savefig(os.path.join(self.dirs["legends"], "scene_legend_base_1row.png"), bbox_inches='tight', pad_inches=0.1*marker_scale)
+        fig.savefig(os.path.join(self.dirs["legends"], "scene_legend_base_1row.pdf"), bbox_inches="tight", pad_inches=0.1*marker_scale)
+        fig.savefig(os.path.join(self.dirs["legends"], "scene_legend_base_1row.png"), bbox_inches="tight", pad_inches=0.1*marker_scale)
         fig.clf()
 
         fig, ax = self._create_dummy_scene(marker_scale, True)
@@ -2098,8 +2481,8 @@ class BACRE2DAstarTrav(AutoSceneGenClient):
         legend.get_frame().set_linewidth(0.8 * marker_scale)
         legend.get_frame().set_facecolor(self.COLOR_LEGEND)
         fig.tight_layout(pad=0., w_pad=0., h_pad=0.)
-        fig.savefig(os.path.join(self.dirs["legends"], "scene_legend_base_test_3col.pdf"), bbox_inches='tight', pad_inches=0.1*marker_scale)
-        fig.savefig(os.path.join(self.dirs["legends"], "scene_legend_base_test_3col.png"), bbox_inches='tight', pad_inches=0.1*marker_scale)
+        fig.savefig(os.path.join(self.dirs["legends"], "scene_legend_base_test_3col.pdf"), bbox_inches="tight", pad_inches=0.1*marker_scale)
+        fig.savefig(os.path.join(self.dirs["legends"], "scene_legend_base_test_3col.png"), bbox_inches="tight", pad_inches=0.1*marker_scale)
         fig.clf()
 
         fig, ax = self._create_dummy_scene(marker_scale, True)
@@ -2109,8 +2492,8 @@ class BACRE2DAstarTrav(AutoSceneGenClient):
         legend.get_frame().set_linewidth(0.8 * marker_scale)
         legend.get_frame().set_facecolor(self.COLOR_LEGEND)
         fig.tight_layout(pad=0., w_pad=0., h_pad=0.)
-        fig.savefig(os.path.join(self.dirs["legends"], "scene_legend_base_test_1col.pdf"), bbox_inches='tight', pad_inches=0.1*marker_scale)
-        fig.savefig(os.path.join(self.dirs["legends"], "scene_legend_base_test_1col.png"), bbox_inches='tight', pad_inches=0.1*marker_scale)
+        fig.savefig(os.path.join(self.dirs["legends"], "scene_legend_base_test_1col.pdf"), bbox_inches="tight", pad_inches=0.1*marker_scale)
+        fig.savefig(os.path.join(self.dirs["legends"], "scene_legend_base_test_1col.png"), bbox_inches="tight", pad_inches=0.1*marker_scale)
         fig.clf()
         
         fig, ax = self._create_dummy_scene(marker_scale, True)
@@ -2120,8 +2503,8 @@ class BACRE2DAstarTrav(AutoSceneGenClient):
         legend.get_frame().set_linewidth(0.8 * marker_scale)
         legend.get_frame().set_facecolor(self.COLOR_LEGEND)
         fig.tight_layout(pad=0., w_pad=0., h_pad=0.)
-        fig.savefig(os.path.join(self.dirs["legends"], "scene_legend_base_test_1row.pdf"), bbox_inches='tight', pad_inches=0.1*marker_scale)
-        fig.savefig(os.path.join(self.dirs["legends"], "scene_legend_base_test_1row.png"), bbox_inches='tight', pad_inches=0.1*marker_scale)
+        fig.savefig(os.path.join(self.dirs["legends"], "scene_legend_base_test_1row.pdf"), bbox_inches="tight", pad_inches=0.1*marker_scale)
+        fig.savefig(os.path.join(self.dirs["legends"], "scene_legend_base_test_1row.png"), bbox_inches="tight", pad_inches=0.1*marker_scale)
         fig.clf()
 
     def make_main_figure_plots(self):
@@ -2175,8 +2558,8 @@ class BACRE2DAstarTrav(AutoSceneGenClient):
         ax.tick_params(axis="both", which="major", labelsize=fontsize, width=0.8*marker_scale, length=3.5*marker_scale, pad=3.5*marker_scale)
         ax.plot(opt_path_x, opt_path_y, zorder=3, linestyle='--', linewidth=2*marker_scale, color=self.COLOR_OPT_REF_PATH, label="Opt. Ref. Path")
 
-        fig.savefig(os.path.join(self.dirs["figures"], "main_bacre_figure_ref_path.pdf"), bbox_inches='tight', pad_inches=0.)
-        fig.savefig(os.path.join(self.dirs["figures"], "main_bacre_figure_ref_path.png"), bbox_inches='tight', pad_inches=0.)
+        fig.savefig(os.path.join(self.dirs["figures"], "main_bacre_figure_ref_path.pdf"), bbox_inches="tight", pad_inches=0.)
+        fig.savefig(os.path.join(self.dirs["figures"], "main_bacre_figure_ref_path.png"), bbox_inches="tight", pad_inches=0.)
         fig.clf()
         plt.close(fig)
 
@@ -2208,8 +2591,8 @@ class BACRE2DAstarTrav(AutoSceneGenClient):
             path_y = vehicle_path[:,1].tolist()
             ax.plot(path_x, path_y, zorder=3, linewidth=2*marker_scale, color=self.COLOR_BASE_AV_PATH, alpha=0.5)
 
-        fig.savefig(os.path.join(self.dirs["figures"], "main_bacre_figure_vehicle_path.pdf"), bbox_inches='tight', pad_inches=0.)
-        fig.savefig(os.path.join(self.dirs["figures"], "main_bacre_figure_vehicle_path.png"), bbox_inches='tight', pad_inches=0.)
+        fig.savefig(os.path.join(self.dirs["figures"], "main_bacre_figure_vehicle_path.pdf"), bbox_inches="tight", pad_inches=0.)
+        fig.savefig(os.path.join(self.dirs["figures"], "main_bacre_figure_vehicle_path.png"), bbox_inches="tight", pad_inches=0.)
         fig.clf()
         plt.close(fig)
 
@@ -2222,9 +2605,9 @@ class BACRE2DAstarTrav(AutoSceneGenClient):
         Returns:
             True if no issues, False otherwise
         """
-        worker : ASGWorkerRef = self.workers[wid]
+        worker : BACREWorkerRef = self.workers[wid]
 
-        if worker.b_waiting_for_analyze_scenario_request:
+        if worker.b_waiting_for_analyze_scenario_request or worker.analyze_scenario_request is None:
             return False
         
         # Save scene captures
@@ -2248,7 +2631,7 @@ class BACRE2DAstarTrav(AutoSceneGenClient):
 
         if len(worker.analyze_scenario_request.vehicle_trajectory) == 0:
             self.log("warn", "AnalyzeScenario request field 'vehicle_trajectory' is empty. Requesting rerun.")
-            self.resubmit_run_scenario_request(wid)
+            self.submit_run_scenario_request(wid, b_reset_num_rerun_requests=False)
             return False
         
         # Get duration of trajectory
@@ -2258,14 +2641,13 @@ class BACRE2DAstarTrav(AutoSceneGenClient):
 
         if worker.analyze_scenario_request.vehicle_sim_time > self.scenario_builder.opr_attr.sim_timeout_period.default + 0.25:
             self.log("warn", f"AnalyzeScenario request vehicle_sim_time of {worker.analyze_scenario_request.vehicle_sim_time} seconds is too long. Requesting rerun.")
-            self.resubmit_run_scenario_request(wid)
+            self.submit_run_scenario_request(wid, b_reset_num_rerun_requests=False)
             return False
 
         # Make sure time stamps are correct
         time_thresh = 1e-5
         if math.fabs(worker.analyze_scenario_request.vehicle_sim_time - sim_time) > time_thresh:
             raise Exception(f"Analyze scenario request for worker {wid}: Computed vehicle sim time of {sim_time:e} differs from expceted value of {worker.analyze_scenario_request.vehicle_sim_time:e} by more than {time_thresh:e} seconds.")
-            # self.log("warn", f"Analyze scenario request for worker {wid}: Computed vehicle sim time of {sim_time:e} differs expcetd value of {worker.analyze_scenario_request.vehicle_sim_time:e} by more than {time_thresh:e} seconds.")
 
         # Extract full trajectory info into lists
         time_since_start = []
@@ -2291,7 +2673,6 @@ class BACRE2DAstarTrav(AutoSceneGenClient):
 
         # Compute regret
         outcome.regret = self.compute_regret(wid)
-        worker.vehicle_path = outcome.vehicle_path
 
         # worker.b_analyzed_scenario = True
         self.log("info", f"Processed AnalyzeScenario request for Worker {wid} / SN {worker.analyze_scenario_request.scenario_number}")
@@ -2303,7 +2684,7 @@ class BACRE2DAstarTrav(AutoSceneGenClient):
         Args:
             - wid: Worker ID
         """
-        worker : ASGWorkerRef = self.workers[wid]
+        worker : BACREWorkerRef = self.workers[wid]
         regret = Regret()
         regret.set_to_zero()
 
@@ -2335,25 +2716,26 @@ class BACRE2DAstarTrav(AutoSceneGenClient):
             regret.cost_error = math.fabs(vehicle_cost - opt_path_cost) / opt_path_cost
             regret.time_error = math.fabs(vehicle_sim_time - opt_path_time) / opt_path_time
             
-            normalizing_distance = fast_norm(goal_location - start_location)
+            if self.b_regret_uses_equivalent_x_errors:
+                normalizing_distance = fast_norm(goal_location - start_location)
 
-            # Equivalent-cost position error
-            if vehicle_cost >= opt_path_cost: 
-                # Optimal agent will have already reached the goal
-                regret.equiv_cost_pos_error = fast_norm(goal_location - vehicle_path[-1]) / normalizing_distance
-            else:
-                # Find the location the optimal agent would reach if given a cost budget of vehicle_cost
-                equiv_cost_pos = cross_linear_interp(vehicle_cost, worker.scenario.opt_path_cost_values, worker.scenario.opt_path)
-                regret.equiv_cost_pos_error = fast_norm(equiv_cost_pos - vehicle_path[-1]) / normalizing_distance
+                # Equivalent-cost position error
+                if vehicle_cost >= opt_path_cost: 
+                    # Optimal agent will have already reached the goal
+                    regret.equiv_cost_pos_error = fast_norm(goal_location - vehicle_path[-1]) / normalizing_distance
+                else:
+                    # Find the location the optimal agent would reach if given a cost budget of vehicle_cost
+                    equiv_cost_pos = cross_linear_interp(vehicle_cost, worker.scenario.opt_path_cost_values, worker.scenario.opt_path)
+                    regret.equiv_cost_pos_error = fast_norm(equiv_cost_pos - vehicle_path[-1]) / normalizing_distance
 
-            # Equivalent-time position error
-            if vehicle_sim_time >= opt_path_time:
-                # Optimal agent will have already reached the goal
-                regret.equiv_time_pos_error = fast_norm(goal_location - vehicle_path[-1]) / normalizing_distance
-            else:
-                # Find the location the optimal agent would reach if given vehicle_sim_time seconds
-                equiv_time_pos = cross_linear_interp(vehicle_sim_time, worker.scenario.opt_path_time_values, worker.scenario.opt_path)
-                regret.equiv_cost_pos_error = fast_norm(equiv_time_pos - vehicle_path[-1]) / normalizing_distance
+                # Equivalent-time position error
+                if vehicle_sim_time >= opt_path_time:
+                    # Optimal agent will have already reached the goal
+                    regret.equiv_time_pos_error = fast_norm(goal_location - vehicle_path[-1]) / normalizing_distance
+                else:
+                    # Find the location the optimal agent would reach if given vehicle_sim_time seconds
+                    equiv_time_pos = cross_linear_interp(vehicle_sim_time, worker.scenario.opt_path_time_values, worker.scenario.opt_path)
+                    regret.equiv_cost_pos_error = fast_norm(equiv_time_pos - vehicle_path[-1]) / normalizing_distance
         
         regret.value = regret.cost_error + regret.time_error + regret.equiv_cost_pos_error + regret.equiv_time_pos_error
 
@@ -2366,7 +2748,7 @@ class BACRE2DAstarTrav(AutoSceneGenClient):
     def num_workers_running_base_scenarios(self):
         n = 0
         for wid,worker in self.workers.items():
-            worker : ASGWorkerRef
+            worker : BACREWorkerRef
             n += worker.b_running_base_scenario
         return n
 
@@ -2445,45 +2827,25 @@ class BACRE2DAstarTrav(AutoSceneGenClient):
                 parent_id = self.scenario_regret_manager.sorted_regrets[idx][0]
             
             # Regret curation ratio
-            elif self.parent_selection_method == self.PAR_SELECT_RCR or self.parent_selection_method == self.PAR_SELECT_RCR_WITH_PARENTS:
-                cutoff_num = 0 # The number of scenarios we will consider in the sorted scenarios list (ranked best to worst)
+            elif self.parent_selection_method == self.PAR_SELECT_RCR:
                 largest_regret = self.scenario_regret_manager.sorted_regrets[0][1]
                 smallest_regret = self.scenario_regret_manager.sorted_regrets[-1][1]
-
-                if largest_regret == smallest_regret:
-                    cutoff_num = self.scenario_regret_manager.num_scenarios()
-                else:
-                    for i in range(self.scenario_regret_manager.num_scenarios()-1):
-                        try:
-                            if (self.scenario_regret_manager.sorted_regrets[i+1][1] - smallest_regret) / (largest_regret - smallest_regret) <= 1. - rcr:
-                                cutoff_num = i + 1
-                                break
-                        except ZeroDivisionError:
-                            cutoff_num = i + 1
-                            break
-                    if cutoff_num == 0:
-                        cutoff_num = self.scenario_regret_manager.num_scenarios()
+                cutoff_regret = largest_regret - rcr * (largest_regret - smallest_regret) # Want scenarios whose regrets lie in the set [cutoff_regret, largest_regret]
                 
-                if self.parent_selection_method == self.PAR_SELECT_RCR:
-                    # Pick from the best cutoff_num scenarios IDs
-                    idx = np.random.randint(cutoff_num)
-                    parent_id = self.scenario_regret_manager.sorted_regrets[idx][0]
+                if rcr == 1. or largest_regret == smallest_regret:
+                    cutoff_num = self.scenario_regret_manager.num_scenarios()
+                
                 else:
-                    # Add the best cutoff_num scenarios IDs and their parents
-                    selection_ids = []
-                    aur_parent_ids = []
-                    for i in range(cutoff_num):
-                        aur_id = self.scenario_regret_manager.sorted_regrets[i][0]
-                        aur_parent_id = self.get_generated_scenario_from_id(aur_id).parent_id
-                        selection_ids.append(aur_id)
-                        aur_parent_ids.append(aur_parent_id)
-                    
-                    for id in aur_parent_ids:
-                        if id is not None and id not in selection_ids:
-                            selection_ids.append(id)
-                    
-                    idx = np.random.randint(len(selection_ids))
-                    parent_id = selection_ids[idx]
+                    cutoff_num = 0
+                    for i in range(self.scenario_regret_manager.num_scenarios()):
+                        if self.scenario_regret_manager.sorted_regrets[i][1] >= cutoff_regret:
+                            cutoff_num += 1
+                        else:
+                            break
+                
+                # Pick from the best cutoff_num scenario IDs
+                idx = np.random.randint(cutoff_num)
+                parent_id = self.scenario_regret_manager.sorted_regrets[idx][0]
         
         return parent_id
 
@@ -2516,7 +2878,7 @@ class BACRE2DAstarTrav(AutoSceneGenClient):
         Args:
             - wid: Worker ID
         """
-        worker : ASGWorkerRef = self.workers[wid]
+        worker : BACREWorkerRef = self.workers[wid]
         self.scenario_builder : ScenarioBuilderAndRefAgent
 
         start_time = time.time()
@@ -2535,20 +2897,22 @@ class BACRE2DAstarTrav(AutoSceneGenClient):
                     return # Just have to wait until base population is created
             else:
                 # Modify the parent scene description
-                self.log("info", "Creating child scenario...")
+                self.log("info", f"Creating child scenario with {self.num_mutations} mutations...")
                 parent_id = self.get_parent_id_for_mutation()
                 parent_scenario = self.get_generated_scenario_from_id(parent_id)
                 scenario_request = self.scenario_builder.create_default_run_scenario_request()
                 scenario_request.scene_description = copy.deepcopy(parent_scenario.scene_description)
-                if len(self.scenario_builder.ssa_attr.var_attrs) > 0 and len(self.scenario_builder.txt_attr.var_attrs) > 0:
-                    if np.random.rand() > 0.5:
+                
+                for _ in range(self.num_mutations):
+                    if len(self.scenario_builder.ssa_attr.var_attrs) > 0 and len(self.scenario_builder.txt_attr.var_attrs) > 0:
+                        if np.random.rand() > 0.5:
+                            self._perturb_str_attr(scenario_request)
+                        else:
+                            self.scenario_builder.perturb_rand_txt_attr(scenario_request)
+                    elif len(self.scenario_builder.ssa_attr.var_attrs) > 0:
                         self._perturb_str_attr(scenario_request)
                     else:
                         self.scenario_builder.perturb_rand_txt_attr(scenario_request)
-                elif len(self.scenario_builder.ssa_attr.var_attrs) > 0:
-                    self._perturb_str_attr(scenario_request)
-                else:
-                    self.scenario_builder.perturb_rand_txt_attr(scenario_request)
         else:
             # Create random scenario with random number of SSAs
             scenario_request = self.scenario_builder.create_default_run_scenario_request()
@@ -2581,7 +2945,7 @@ class BACRE2DAstarTrav(AutoSceneGenClient):
         Returns:
             True if successful, False otherwise.
         """
-        worker : ASGWorkerRef = self.workers[wid]
+        worker : BACREWorkerRef = self.workers[wid]
 
         filepath = os.path.join(worker.vehicle_node_save_dir, "astar_path_snapshots.pkl")
         if os.path.exists(filepath):
@@ -2626,15 +2990,13 @@ class BACRE2DAstarTrav(AutoSceneGenClient):
         if not self.mode[self.MODE_BACRE]:
             return
         
-        worker : ASGWorkerRef = self.workers[wid]
-
-        # Check if any vehicle nodes unregistered during base scenario creation
-        if worker.b_running_base_scenario and len(worker.registered_vehicle_nodes) != self.num_vehicle_nodes:
-            self.log("info", f"A vehicle node for Worker {wid} unregistered while running a base scenario. Resetting worker.")
-            worker.reset()
+        worker : BACREWorkerRef = self.workers[wid]
 
         if not self.are_all_vehicle_nodes_ready(wid):
             return
+        
+        if wid not in self.worker_mspids.keys():
+            self.worker_mspids[wid] = 1 # This value is meaningless, it's just so we can add the worker to the worker_mspids dict
 
         worker.vehicle_node_save_dir = self.temp_vehicle_node_save_dirs[wid]
         worker.b_save_minimal = True
@@ -2646,7 +3008,7 @@ class BACRE2DAstarTrav(AutoSceneGenClient):
             return
                 
         # Block until ready to analyze scenario
-        if worker.b_waiting_for_analyze_scenario_request:
+        if worker.b_waiting_for_analyze_scenario_request or worker.analyze_scenario_request is None:
             return
 
         self.log("info", "-" * 30 + f'BACRE STEP (wid {wid})' + "-" * 30, b_log_ros=False)
@@ -2667,7 +3029,7 @@ class BACRE2DAstarTrav(AutoSceneGenClient):
         if not b_loaded_vehicle_node_data:
             self.log("error", f"At least one vehicle node file was not loaded or does not exist. Will remove last scenario outcome and resubmit RunScenario request.")
             worker.remove_last_scenario_outcome()
-            self.resubmit_run_scenario_request(wid)
+            self.submit_run_scenario_request(wid, b_reset_num_rerun_requests=False)
             return
 
         # Verify the simulation did not miss too many control commands. Use tight tolerance of 2%.
@@ -2675,14 +3037,14 @@ class BACRE2DAstarTrav(AutoSceneGenClient):
         if math.fabs(worker.analyze_scenario_request.num_vehicle_control_messages - num_vehicle_control_messages_sent) > round(0.02*num_vehicle_control_messages_sent):
             self.log("error", f"UE4 simulation missed too many control commands. Sent {num_vehicle_control_messages_sent} but only {worker.analyze_scenario_request.num_vehicle_control_messages} were received. Will try again.")
             worker.remove_last_scenario_outcome()
-            self.resubmit_run_scenario_request(wid)
+            self.submit_run_scenario_request(wid, b_reset_num_rerun_requests=False)
             return
         
         # Check for rerun request
         if worker.b_vehicle_node_requested_rerun and worker.num_rerun_requests <= self.MAX_RERUN_REQUESTS:
             self.log("warn", f"Resubmitting RunScenario request due to rerun request.")
             worker.remove_last_scenario_outcome()
-            self.resubmit_run_scenario_request(wid)
+            self.submit_run_scenario_request(wid, b_reset_num_rerun_requests=False)
             return
 
         # Run required number of scenario runs
@@ -2732,12 +3094,7 @@ class BACRE2DAstarTrav(AutoSceneGenClient):
             self.analyze_generated_scenarios_snapshots()
             self.process_scene_capture_request()
 
-            # Run scene captures
-            # self.plot_max_regret_scenes()
-            # self.process_replay_request()
             return
-        
-        worker.b_need_new_scenario = True
 
     def analyze_replay_scenario(self, scenario_dir: str, scenario: Scenario = None):
         """Analyze a replay scenario
@@ -2768,49 +3125,50 @@ class BACRE2DAstarTrav(AutoSceneGenClient):
         file_name = os.path.join(scenario_dir, "orig_scene_with_replay")
         self.plot_scene_from_scenario(original_scenario, file_name, test_vehicle_paths=replay_scenario.get_vehicle_paths())
 
-        if self.scenario_analysis is None:
-            raise ValueError(f"ScenarioAnalysis is None. Cannot finish analyzing replay scenario.")
+        if self.scenario_analysis is not None:
+            # Analyze snapshots and write values to txt file
+            (mean_astar_replan_angle, 
+                max_astar_replan_angle, 
+                mean_path_follower_angle, 
+                max_path_follower_angle, 
+                avg_loops_per_path,
+                weighted_obstacle_detection_distance,
+                mean_image_processing_durations, 
+                max_image_processing_durations, 
+                mean_astar_replan_iterations, 
+                max_astar_replan_iterations, 
+                mean_astar_replan_durations, 
+                max_astar_replan_durations) = self.analyze_scenario_snapshots(replay_scenario)
+            
+            # Write stats to txt file
+            analysis_results_filepath = os.path.join(scenario_dir, "scenario_analysis.txt")
+            id = replay_scenario.id
+            with open(analysis_results_filepath, "w") as f:
+                f.write(f"Scenario Analysis and Comparsion:\n")
 
-        # Analyze snapshots and write values to txt file
-        (mean_astar_replan_angle, 
-            max_astar_replan_angle, 
-            mean_path_follower_angle, 
-            max_path_follower_angle, 
-            avg_loops_per_path,
-            weighted_obstacle_detection_distance,
-            mean_image_processing_durations, 
-            max_image_processing_durations, 
-            mean_astar_replan_iterations, 
-            max_astar_replan_iterations, 
-            mean_astar_replan_durations, 
-            max_astar_replan_durations) = self.analyze_scenario_snapshots(replay_scenario)
-        
-        # Write stats to txt file
-        analysis_results_filepath = os.path.join(scenario_dir, "scenario_analysis.txt")
-        id = replay_scenario.id
-        with open(analysis_results_filepath, "w") as f:
-            f.write(f"Scenario Analysis and Comparsion:\n")
+                f.write(f"Original Avg. Regret: {original_scenario.avg_regret.value:.4f} \n")
+                f.write(f"Replay Avg. Regret: {replay_scenario.avg_regret.value:.4f} \n")
 
-            f.write(f"Original Avg. Regret: {original_scenario.avg_regret.value:.4f} \n")
-            f.write(f"Replay Avg. Regret: {replay_scenario.avg_regret.value:.4f} \n")
+                f.write(f"Mean A* Replan Angle [deg]: Orig {self.scenario_analysis.mean_astar_replan_angle[id]:.4f}, New {mean_astar_replan_angle:.4f} \n")
+                f.write(f"Max A* Replan Angle [deg]: Orig {self.scenario_analysis.max_astar_replan_angle[id]:.4f}, New {max_astar_replan_angle:.4f} \n")
 
-            f.write(f"Mean A* Replan Angle [deg]: Orig {self.scenario_analysis.mean_astar_replan_angle[id]:.4f}, New {mean_astar_replan_angle:.4f} \n")
-            f.write(f"Max A* Replan Angle [deg]: Orig {self.scenario_analysis.max_astar_replan_angle[id]:.4f}, New {max_astar_replan_angle:.4f} \n")
+                f.write(f"Mean Path Follower Angle [deg]: Orig {self.scenario_analysis.mean_path_follower_angle[id]:.4f}, New {mean_path_follower_angle:.4f} \n")
+                f.write(f"Max Path Follower Angle [deg]: Orig {self.scenario_analysis.max_path_follower_angle[id]:.4f}, New {max_path_follower_angle:.4f} \n")
 
-            f.write(f"Mean Path Follower Angle [deg]: Orig {self.scenario_analysis.mean_path_follower_angle[id]:.4f}, New {mean_path_follower_angle:.4f} \n")
-            f.write(f"Max Path Follower Angle [deg]: Orig {self.scenario_analysis.max_path_follower_angle[id]:.4f}, New {max_path_follower_angle:.4f} \n")
+                f.write(f"Avg. Loops Per Path: Orig {self.scenario_analysis.avg_loops_per_path[id]:.4f}, New {avg_loops_per_path:.4f} \n")
+                f.write(f"Weighted Obstacle Detection Distance [m]: Orig {self.scenario_analysis.weighted_obstacle_detection_distance[id]:.4f}, New {weighted_obstacle_detection_distance:.4f} \n")
 
-            f.write(f"Avg. Loops Per Path: Orig {self.scenario_analysis.avg_loops_per_path[id]:.4f}, New {avg_loops_per_path:.4f} \n")
-            f.write(f"Weighted Obstacle Detection Distance [m]: Orig {self.scenario_analysis.weighted_obstacle_detection_distance[id]:.4f}, New {weighted_obstacle_detection_distance:.4f} \n")
+                f.write(f"Mean Image Processing Time [s]: Orig {self.scenario_analysis.mean_image_processing_durations[id]:.4f}, New {mean_image_processing_durations:.4f} \n")
+                f.write(f"Max Image Processing Time [s]: Orig {self.scenario_analysis.max_image_processing_durations[id]:.4f}, New {max_image_processing_durations:.4f} \n")
 
-            f.write(f"Mean Image Processing Time [s]: Orig {self.scenario_analysis.mean_image_processing_durations[id]:.4f}, New {mean_image_processing_durations:.4f} \n")
-            f.write(f"Max Image Processing Time [s]: Orig {self.scenario_analysis.max_image_processing_durations[id]:.4f}, New {max_image_processing_durations:.4f} \n")
+                f.write(f"Mean A* Replan Iterations: Orig {self.scenario_analysis.mean_astar_replan_iterations[id]:.4f}, New {mean_astar_replan_iterations:.4f} \n")
+                f.write(f"Max A* Replan Iterations: Orig {self.scenario_analysis.max_astar_replan_iterations[id]:.4f}, New {max_astar_replan_iterations:.4f} \n")
 
-            f.write(f"Mean A* Replan Iterations: Orig {self.scenario_analysis.mean_astar_replan_iterations[id]:.4f}, New {mean_astar_replan_iterations:.4f} \n")
-            f.write(f"Max A* Replan Iterations: Orig {self.scenario_analysis.max_astar_replan_iterations[id]:.4f}, New {max_astar_replan_iterations:.4f} \n")
+                f.write(f"Mean A* Replan Time [s]: Orig {self.scenario_analysis.mean_astar_replan_durations[id]:.4f}, New {mean_astar_replan_durations:.4f} \n")
+                f.write(f"Max A* Replan Time [s]: Orig {self.scenario_analysis.max_astar_replan_durations[id]:.4f}, New {max_astar_replan_durations:.4f} \n")
 
-            f.write(f"Mean A* Replan Time [s]: Orig {self.scenario_analysis.mean_astar_replan_durations[id]:.4f}, New {mean_astar_replan_durations:.4f} \n")
-            f.write(f"Max A* Replan Time [s]: Orig {self.scenario_analysis.max_astar_replan_durations[id]:.4f}, New {max_astar_replan_durations:.4f} \n")
+        else:
+            self.log("warn", f"ScenarioAnalysis is None. Made plots, but cannot finish analyzing replay scenario.")
 
     def create_replay_worker_save_dir(self, wid: int):
         """Create the save directory for this replay worker's ROS nodes. If replaying from a different experiment, that relative path will appear in the save path.
@@ -2818,18 +3176,17 @@ class BACRE2DAstarTrav(AutoSceneGenClient):
         Args:
             - wid: Worker ID
         """
-        worker : ASGWorkerRef = self.workers[wid]
+        worker : BACREWorkerRef = self.workers[wid]
         replay_num = worker.num_scenario_runs + 1
 
         worker.b_save_minimal = False
-        if self.replay_request['request'] == str.lower('rankings'):
-            rank = self.replay_rankings[self.replay_worker_scenario_idx[wid]]
-            worker.vehicle_node_save_dir = os.path.join(self.dirs['replay'], self.replay_from_dir_suffix, f"rankings", f"rank_{rank}", f"replay_{replay_num}")
-            
-            if replay_num == 1:
-                parent_dir = os.path.abspath(os.path.join(worker.vehicle_node_save_dir, '..'))
-                if os.path.isdir(parent_dir):
-                    shutil.rmtree(parent_dir)
+        rank = self.replay_rankings[self.worker_mspids[wid]]
+        worker.vehicle_node_save_dir = os.path.join(self.dirs['replay'], f"rankings", f"rank_{rank}", f"replay_{replay_num}")
+        
+        if replay_num == 1:
+            parent_dir = os.path.abspath(os.path.join(worker.vehicle_node_save_dir, '..'))
+            if os.path.isdir(parent_dir):
+                shutil.rmtree(parent_dir)
 
         # Recreate temp vehicle node save dir
         if os.path.isdir(self.temp_vehicle_node_save_dirs[wid]):
@@ -2848,7 +3205,7 @@ class BACRE2DAstarTrav(AutoSceneGenClient):
             - wid: Worker ID
             - scenario: The scenario to be replayed (argument will not be modified)
         """
-        worker : ASGWorkerRef = self.workers[wid]
+        worker : BACREWorkerRef = self.workers[wid]
         worker.reset()
 
         worker.scenario = copy.deepcopy(scenario)
@@ -2865,45 +3222,34 @@ class BACRE2DAstarTrav(AutoSceneGenClient):
         Args:
             - wid: Worker ID
         """
-        worker : ASGWorkerRef = self.workers[wid]
+        worker : BACREWorkerRef = self.workers[wid]
 
         if not self.mode[self.MODE_REPLAY]:
             return
 
         if not self.are_all_vehicle_nodes_ready(wid):
             return
-
-        if wid not in self.replay_worker_scenario_idx.keys():            
-            if self.num_replay_scenarios_not_started > 0 and (worker.scenario_number == 0 or not worker.b_waiting_for_analyze_scenario_request):
-                b_copied_worker = False
-                self.log("info", "-" * 30 + f'REPLAY (wid {wid})' + "-" * 30, b_log_ros=False)
-                try:
-                    self.worker_backups[wid] = copy.deepcopy(worker) # Backup original worker, we will get back to it later
-                    b_copied_worker = True
-                except Exception:
-                    self.log("warn", f"Exception when deepcopying ASGWorkerRef for Worker {wid}: {traceback.format_exc()}")
-                    b_copied_worker = False
             
-                if b_copied_worker:
-                    self.replay_worker_scenario_idx[wid] = len(self.replay_scenarios) - self.num_replay_scenarios_not_started
-                    self.num_replay_scenarios_not_started -= 1 # This line comes after we set the idx
-                    
-                    self.replay_scenario(wid, self.replay_scenarios[self.replay_worker_scenario_idx[wid]])
-                    self.create_replay_worker_save_dir(wid)
-                else:
-                    return
+        if wid not in self.worker_mspids.keys():
+            if self.num_mspids_remaining() > 0 and not worker.b_waiting_for_analyze_scenario_request:
+                self.log("info", "-" * 30 + f"REPLAY (wid {wid})" + "-" * 30, b_log_ros=False)
+                self.worker_mspids[wid] = self.get_next_mspid()
+                scenario_idx = self.worker_mspids[wid]
+                self.replay_scenario(wid, self.replay_scenarios[scenario_idx])
+                self.create_replay_worker_save_dir(wid)
+                return
             else:
                 return
         
         # Block until ready to analyze scenario
-        if worker.b_waiting_for_analyze_scenario_request:
+        if worker.b_waiting_for_analyze_scenario_request or worker.analyze_scenario_request is None:
             return
 
-        self.log("info", "-" * 30 + f'REPLAY (wid {wid})' + "-" * 30, b_log_ros=False)
+        self.log("info", "-" * 30 + f"REPLAY (wid {wid})" + "-" * 30, b_log_ros=False)
         if not self.process_analyze_scenario_request(wid):
             return
 
-        self.log("info", f"Replay Worker {wid} / Scenario Index {self.replay_worker_scenario_idx[wid]} / Replay {worker.num_scenario_runs}: Regret = {worker.scenario.outcomes[-1].regret.value:.4f}")
+        self.log("info", f"Replay Worker {wid} / Scenario Index {self.worker_mspids[wid]} / Replay {worker.num_scenario_runs}: Regret = {worker.scenario.outcomes[-1].regret.value:.4f}")
 
         # Add vehicle node data to scenario outcome
         b_loaded_vehicle_node_data = self.load_vehicle_node_data(wid)
@@ -2911,7 +3257,7 @@ class BACRE2DAstarTrav(AutoSceneGenClient):
         if not b_loaded_vehicle_node_data:
             self.log("error", f"At least one vehicle node file was not loaded or does not exist. Will remove last scenario outcome and resubmit RunScenario request.")
             worker.remove_last_scenario_outcome()
-            self.resubmit_run_scenario_request(wid)
+            self.submit_run_scenario_request(wid, b_reset_num_rerun_requests=False)
             return
         
         # Verify the simulation did not miss too many control commands. Use tight tolerance of 2%.
@@ -2919,26 +3265,25 @@ class BACRE2DAstarTrav(AutoSceneGenClient):
         if math.fabs(worker.analyze_scenario_request.num_vehicle_control_messages - num_vehicle_control_messages_sent) > round(0.02*num_vehicle_control_messages_sent):
             self.log("error", f"UE4 simulation missed too many control commands. Sent {num_vehicle_control_messages_sent} but only {worker.analyze_scenario_request.num_vehicle_control_messages} were received. Will try again.")
             worker.remove_last_scenario_outcome()
-            self.resubmit_run_scenario_request(wid)
+            self.submit_run_scenario_request(wid, b_reset_num_rerun_requests=False)
             return
         
         # Check for rerun request
         if worker.b_vehicle_node_requested_rerun and worker.num_rerun_requests <= self.MAX_RERUN_REQUESTS:
             self.log("warn", f"Resubmitting RunScenario request due to rerun request.")
             worker.remove_last_scenario_outcome()
-            self.resubmit_run_scenario_request(wid)
+            self.submit_run_scenario_request(wid, b_reset_num_rerun_requests=False)
             return
 
         # Replay same scenario again, or advance to another scenario to replay
         if worker.num_scenario_runs < self.num_replays_per_scenario:
-            # self.replay_scenario(wid, self.replay_scenarios[self.replay_worker_scenario_idx[wid]])
             self.submit_run_scenario_request(wid, b_reset_num_rerun_requests=False)
             self.create_replay_worker_save_dir(wid)
         else:
             parent_dir = os.path.abspath(os.path.join(worker.vehicle_node_save_dir, '..'))
             
             worker.scenario.estimate_regret()
-            self.log("info", f"Replay Worker {wid} / Scenario Index {self.replay_worker_scenario_idx[wid]} / Replay {worker.num_scenario_runs}: Avg. Regret = {worker.scenario.avg_regret.value:.4f}")
+            self.log("info", f"Replay Worker {wid} / Scenario Index {self.worker_mspids[wid]} / Replay {worker.num_scenario_runs}: Avg. Regret = {worker.scenario.avg_regret.value:.4f}")
             
             # Save replay scenario with all outcomes
             replay_scenario_file = os.path.join(parent_dir, "scenario.pkl")
@@ -2948,23 +3293,19 @@ class BACRE2DAstarTrav(AutoSceneGenClient):
 
             self.analyze_replay_scenario(parent_dir, worker.scenario)
             
-            self.num_replay_scenarios_completed += 1
+            self.mspids_completed.append(self.worker_mspids[wid])
+            self.worker_mspids.pop(wid)
 
-            if self.num_replay_scenarios_not_started > 0:
-                self.replay_worker_scenario_idx[wid] = len(self.replay_scenarios) - self.num_replay_scenarios_not_started
-                self.num_replay_scenarios_not_started -= 1 # This line comes after we set the idx
-
-                self.replay_scenario(wid, self.replay_scenarios[self.replay_worker_scenario_idx[wid]])
+            if self.num_mspids_remaining() > 0:
+                self.worker_mspids[wid] = self.get_next_mspid()
+                scenario_idx = self.worker_mspids[wid]
+                self.replay_scenario(wid, self.replay_scenarios[scenario_idx])
                 self.create_replay_worker_save_dir(wid)
             else:
-                self.replay_worker_scenario_idx.pop(wid)
-                self.workers[wid] = self.worker_backups.pop(wid) # Put back original worker in its spot
                 self.log("info", f"Worker {wid} done with replay")
 
-            if self.num_replay_scenarios_completed == len(self.replay_scenarios):
+            if len(self.mspids_completed) == len(self.mspids):
                 self.mode[self.MODE_REPLAY] = False
-                self.mode[self.MODE_REPLAY_FROM_DIR] = False
-                self.replay_worker_scenario_idx.clear()
                 self.log("info", f"Finished replay mode")
 
                 return
@@ -2981,20 +3322,23 @@ class BACRE2DAstarTrav(AutoSceneGenClient):
         if not self.are_all_vehicle_nodes_ready(wid):
             return
 
-        worker : ASGWorkerRef = self.workers[wid]
+        worker : BACREWorkerRef = self.workers[wid]
         worker.vehicle_node_save_dir = self.temp_vehicle_node_save_dirs[wid]
         worker.b_save_minimal = True
 
+        if wid not in self.worker_mspids.keys():
+            self.worker_mspids[wid] = 1 # This value is meaningless, it's just so we can add the worker to the worker_mspids dict
+
         if worker.b_need_new_scenario:
-            self.log("info", "-" * 30 + f'RANDOM STEP (wid {wid})' + "-" * 30, b_log_ros=False)
+            self.log("info", "-" * 30 + f"RANDOM STEP (wid {wid})" + "-" * 30, b_log_ros=False)
             self.create_scenario(wid)
             return
                 
         # Block until ready to analyze scenario
-        if worker.b_waiting_for_analyze_scenario_request:
+        if worker.b_waiting_for_analyze_scenario_request or worker.analyze_scenario_request is None:
             return
 
-        self.log("info", "-" * 30 + f'RANDOM STEP (wid {wid})' + "-" * 30, b_log_ros=False)
+        self.log("info", "-" * 30 + f"RANDOM STEP (wid {wid})" + "-" * 30, b_log_ros=False)
         if not self.process_analyze_scenario_request(wid):
             return
 
@@ -3012,7 +3356,7 @@ class BACRE2DAstarTrav(AutoSceneGenClient):
         if not b_loaded_vehicle_node_data:
             self.log("error", f"At least one vehicle node file was not loaded or does not exist. Will remove last scenario outcome and resubmit RunScenario request.")
             worker.remove_last_scenario_outcome()
-            self.resubmit_run_scenario_request(wid)
+            self.submit_run_scenario_request(wid, b_reset_num_rerun_requests=False)
             return
         
         # Verify the simulation did not miss too many control commands. Use tight tolerance of 2%.
@@ -3020,14 +3364,14 @@ class BACRE2DAstarTrav(AutoSceneGenClient):
         if math.fabs(worker.analyze_scenario_request.num_vehicle_control_messages - num_vehicle_control_messages_sent) > round(0.02*num_vehicle_control_messages_sent):
             self.log("error", f"UE4 simulation missed too many control commands. Sent {num_vehicle_control_messages_sent} but only {worker.analyze_scenario_request.num_vehicle_control_messages} were received. Will try again.")
             worker.remove_last_scenario_outcome()
-            self.resubmit_run_scenario_request(wid)
+            self.submit_run_scenario_request(wid, b_reset_num_rerun_requests=False)
             return
         
         # Check for rerun request
         if worker.b_vehicle_node_requested_rerun and worker.num_rerun_requests <= self.MAX_RERUN_REQUESTS:
             self.log("warn", f"Resubmitting RunScenario request due to rerun request.")
             worker.remove_last_scenario_outcome()
-            self.resubmit_run_scenario_request(wid)
+            self.submit_run_scenario_request(wid, b_reset_num_rerun_requests=False)
             return
 
         # Run required number of scenario runs
@@ -3077,14 +3421,224 @@ class BACRE2DAstarTrav(AutoSceneGenClient):
             self.analyze_generated_scenarios_snapshots()
             self.process_scene_capture_request()
 
-            # self.plot_max_regret_scenes()
-            # self.process_replay_request()
+            return
+
+    def run_scenario_for_cga(self, wid: int, temp_id: int):
+        worker : BACREWorkerRef = self.workers[wid]
+        
+        worker.scenario = self.load_cga_temp_scenario(temp_id)
+        worker.scenario.outcomes.clear()
+        worker.run_scenario_request = self.scenario_builder.create_default_run_scenario_request()
+        worker.run_scenario_request.scene_description = worker.scenario.scene_description
+
+        worker.run_scenario_request.take_scene_capture = False
+        worker.run_scenario_request.scene_capture_only = False
+        worker.run_scenario_request.scene_capture_settings = copy.deepcopy(self.scene_capture_settings)
+
+        self.log("info", f"Running CGA scenario for Worker {wid} / Temp ID {temp_id}")
+        self.submit_run_scenario_request(wid)
+
+    def run_cga_step(self, wid: int):
+        """Run a CGA step for the given worker
+
+        Args:
+            - wid: Worker ID
+        """
+        if not self.mode[self.MODE_CGA]:
             return
         
-        worker.b_need_new_scenario = True
+        worker : BACREWorkerRef = self.workers[wid]
+
+        # Create scenario requests for a new population
+        if len(self.mspids) == 0 and self.cga_population_manager.num_populations() < self.cga_num_populations:
+            start_time = time.time()
+
+            # Create parent IDs and temp IDs for new population
+            if self.cga_population_manager.num_populations() == 0:
+                cga_scenario_temp_ids = np.arange(self.cga_population_size)
+            else:
+                cga_scenario_temp_ids = np.arange(self.cga_population_size - self.cga_num_families_per_population*2)
+                for i in range(self.cga_num_families_per_population):
+                    p1_id = self.scenario_regret_manager.sorted_regrets[i*2][0]
+                    p2_id = self.scenario_regret_manager.sorted_regrets[i*2 + 1][0]
+                    self.cga_parent_ids.append((p1_id, p2_id))
+                    
+                    self.cga_population_idxs.append(p1_id)
+                    self.cga_population_idxs.append(p2_id)
+            cga_scenario_temp_ids += self.scenario_regret_manager.num_scenarios()
+            self.mspids = cga_scenario_temp_ids.tolist()
+
+            # Check if scenario requests were already created
+            b_precompute_population_scenarios = False
+            for temp_id in self.mspids:
+                file_path = os.path.join(self.cga_temp_save_dir, f"scenario_temp_{temp_id}.pkl")
+                if not os.path.exists(file_path):
+                    b_precompute_population_scenarios = True
+                    break
+
+            if b_precompute_population_scenarios:
+                chunk_size = math.ceil(len(self.mspids) / self.cga_num_families_per_population)
+                processes : List[multiprocessing.Process] = []
+                pid = 0
+                for i in range(0, len(self.mspids), chunk_size):
+                    if len(self.cga_parent_ids) > 0:
+                        scenario1 = self.get_generated_scenario_from_id(self.cga_parent_ids[pid][0])
+                        scenario2 = self.get_generated_scenario_from_id(self.cga_parent_ids[pid][1])
+                    else:
+                        scenario1 = None
+                        scenario2 = None
+
+                    p = multiprocessing.Process(target = multiprocess_create_cga_scenarios, 
+                                                args = (pid, 
+                                                        copy.deepcopy(scenario1),
+                                                        copy.deepcopy(scenario2),
+                                                        self.cga_mutation_prob,
+                                                        copy.deepcopy(self.scenario_builder),
+                                                        self.mspids[i:i+chunk_size],
+                                                        self.cga_temp_save_dir
+                                                        )
+                                                )
+                    p.start()
+                    processes.append(p)
+                    pid += 1
+                for p in processes:
+                    p.join()
+
+                wall_time = (time.time() - start_time)/60.
+                self.log("info", f"Finished computing reference trajectories for new CGA population in {wall_time:.2} minutes")
+            else:
+                self.log("info", f"CGA population scenario requests already created.")
+        
+        if not self.are_all_vehicle_nodes_ready(wid):
+            return
+
+        worker.vehicle_node_save_dir = self.temp_vehicle_node_save_dirs[wid]
+        worker.b_save_minimal = True
+
+        if wid not in self.worker_mspids.keys():
+            if self.num_mspids_remaining() > 0 and not worker.b_waiting_for_analyze_scenario_request:
+                self.log("info", "-" * 30 + f"CGA STEP (wid {wid})" + "-" * 30, b_log_ros=False)
+                self.worker_mspids[wid] = self.get_next_mspid()
+                self.run_scenario_for_cga(wid, self.worker_mspids[wid])
+                return
+            else:
+                return
+                
+        # Block until ready to analyze scenario
+        if worker.b_waiting_for_analyze_scenario_request or worker.analyze_scenario_request is None:
+            return
+        
+        self.log("info", "-" * 30 + f"CGA STEP (wid {wid})" + "-" * 30, b_log_ros=False)
+        if not self.process_analyze_scenario_request(wid):
+            return
+        
+        succ_fail = "Success" if worker.scenario.outcomes[-1].succeeded else "Fail"
+        self.log("info", f"Worker {wid} / SN {worker.scenario_number} / Temp ID {worker.scenario.temp_id} / Run {worker.num_scenario_runs}: {succ_fail}, Regret = {worker.scenario.outcomes[-1].regret.value:.4f}")
+        
+        # Add vehicle node data to scenario outcome
+        b_loaded_vehicle_node_data = self.load_vehicle_node_data(wid)
+
+        # Recreate vehicle node save dir
+        if os.path.isdir(worker.vehicle_node_save_dir):
+            shutil.rmtree(worker.vehicle_node_save_dir)
+        os.makedirs(worker.vehicle_node_save_dir, exist_ok = True)
+        
+        if not b_loaded_vehicle_node_data:
+            self.log("error", f"At least one vehicle node file was not loaded or does not exist. Will remove last scenario outcome and resubmit RunScenario request.")
+            worker.remove_last_scenario_outcome()
+            self.submit_run_scenario_request(wid, b_reset_num_rerun_requests=False)
+            return
+
+        # Verify the simulation did not miss too many control commands. Use tight tolerance of 2%.
+        num_vehicle_control_messages_sent = worker.scenario.outcomes[-1].path_follower_snapshots_summary.num_control_messages
+        if math.fabs(worker.analyze_scenario_request.num_vehicle_control_messages - num_vehicle_control_messages_sent) > round(0.02*num_vehicle_control_messages_sent):
+            self.log("error", f"UE4 simulation missed too many control commands. Sent {num_vehicle_control_messages_sent} but only {worker.analyze_scenario_request.num_vehicle_control_messages} were received. Will try again.")
+            worker.remove_last_scenario_outcome()
+            self.submit_run_scenario_request(wid, b_reset_num_rerun_requests=False)
+            return
+        
+        # Check for rerun request
+        if worker.b_vehicle_node_requested_rerun and worker.num_rerun_requests <= self.MAX_RERUN_REQUESTS:
+            self.log("warn", f"Resubmitting RunScenario request due to rerun request.")
+            worker.remove_last_scenario_outcome()
+            self.submit_run_scenario_request(wid, b_reset_num_rerun_requests=False)
+            return
+
+        # Run required number of scenario runs
+        if worker.num_scenario_runs < self.num_runs_per_scenario:
+            worker.run_scenario_request.take_scene_capture = False
+            self.submit_run_scenario_request(wid, b_reset_num_rerun_requests=False)
+            return
+    
+        worker.scenario.estimate_regret()
+        self.scenario_regret_manager.add_scenario(worker.scenario)
+
+        self.mspids_completed.append(worker.scenario.temp_id)
+        self.cga_population_idxs.append(worker.scenario.id)
+
+        self.log("info", f"Worker {wid} / SN {worker.scenario_number} / Temp ID {worker.scenario.temp_id} / Avg. Regret = {worker.scenario.avg_regret.value:.4f}")
+        self.log("info", f"Total Scenarios Collected: {self.scenario_regret_manager.num_scenarios()}")
+        self.log("info", f"Num. Scenarios Collected in current CGA Population: {len(self.mspids_completed)}")
+        self.generated_scenarios[worker.scenario.id] = worker.scenario
+        self.save_generated_scenario(worker.scenario)
+
+        if worker.scenario.avg_regret.value > self.max_regret_achieved:
+            self.max_regret_achieved = worker.scenario.avg_regret.value
+            self.plot_max_regret_scene()
+
+        worker.reset()
+        self.worker_mspids.pop(wid)
+
+        # Check if population is done
+        if self.num_mspids_remaining() > 0:
+            self.worker_mspids[wid] = self.get_next_mspid()
+            self.run_scenario_for_cga(wid, self.worker_mspids[wid])
+            return
+        
+        if len(self.mspids_completed) == len(self.mspids):
+            self.cga_population_manager.population_idxs.append(self.cga_population_idxs)
+            self.cga_population_manager.population_parent_idxs.append(self.cga_parent_ids)
+            self.cga_population_manager.max_population_regret.append(self.max_regret_achieved)
+
+            regret_sum = 0.
+            for id in self.cga_population_idxs:
+                regret_sum += self.get_generated_scenario_from_id(id).avg_regret.value
+            self.cga_population_manager.avg_population_regret.append(regret_sum / self.cga_population_size)
+            
+            self.mspids.clear()
+            self.mspids_completed.clear()
+            self.cga_population_idxs = []
+            self.cga_parent_ids = []
+
+            self.save_scenario_regret_manager()
+            self.save_cga_population_manager()
+
+            self.plot_scenario_rankings()
+
+            # Recreate temp vehicle node save dir
+            if os.path.isdir(self.cga_temp_save_dir):
+                shutil.rmtree(self.cga_temp_save_dir)
+            os.makedirs(self.cga_temp_save_dir, exist_ok = True)
+            self.log("info", f"Emptied CGA temp save dir")
+
+        # Check if done creating scenarios
+        if self.cga_population_manager.num_populations() >= self.cga_num_populations:
+            self.log("info", f"Done creating CGA populations. Created {self.cga_population_manager.num_populations()} populations. Entering replay mode.")
+            self.mode[self.MODE_CGA] = False
+            self.mode[self.MODE_SCENE_CAPTURE] = True
+
+            # Cancel any attempts to send non-local WIDs their latest RunScenario requests (if they were previously unsuccessful)
+            for wid2 in self.recognized_wids:
+                self.cancel_submitting_run_scenario_request(wid2)
+
+            self.plot_scenario_rankings()
+            self.analyze_generated_scenarios_snapshots()
+            self.process_scene_capture_request()
+
+            return
 
     def run_scenario_for_scene_capture(self, wid: int, scenario_id: int):
-        worker : ASGWorkerRef = self.workers[wid]
+        worker : BACREWorkerRef = self.workers[wid]
         
         worker.scenario = copy.deepcopy(self.get_generated_scenario_from_id(scenario_id))
         worker.scenario.outcomes.clear()
@@ -3109,42 +3663,42 @@ class BACRE2DAstarTrav(AutoSceneGenClient):
         if not self.are_all_vehicle_nodes_ready(wid):
             return
         
-        worker : ASGWorkerRef = self.workers[wid]
-
-        if wid not in self.scene_capture_worker_idx.keys():
-            if self.num_scene_captures_not_started > 0 and (worker.scenario_number == 0 or not worker.b_waiting_for_analyze_scenario_request):
-                self.log("info", "-" * 30 + f'SCENE CAPTURE STEP (wid {wid})' + "-" * 30, b_log_ros=False)
-                self.scene_capture_worker_idx[wid] = len(self.scene_capture_scenario_ids) - self.num_scene_captures_not_started
-                self.num_scene_captures_not_started -= 1 # This line comes after we set the idx
-                scenario_id = self.scene_capture_scenario_ids[self.scene_capture_worker_idx[wid]]
+        worker : BACREWorkerRef = self.workers[wid]
+            
+        if wid not in self.worker_mspids.keys():
+            if self.num_mspids_remaining() > 0 and not worker.b_waiting_for_analyze_scenario_request:
+                self.log("info", "-" * 30 + f"SCENE CAPTURE STEP (wid {wid})" + "-" * 30, b_log_ros=False)
+                self.worker_mspids[wid] = self.get_next_mspid()
+                scenario_id = self.worker_mspids[wid]
                 self.run_scenario_for_scene_capture(wid, scenario_id)
                 return
             else:
                 return
                 
         # Block until ready to analyze scenario
-        if worker.b_waiting_for_analyze_scenario_request:
+        if worker.b_waiting_for_analyze_scenario_request or worker.analyze_scenario_request is None:
             return
 
         self.log("info", "-" * 30 + f'SCENE CAPTURE STEP (wid {wid})' + "-" * 30, b_log_ros=False)
         if not self.process_analyze_scenario_request(wid):
             return
-        self.num_scene_captures_completed += 1
-        self.log("info", f"Num. Captures Completed: {self.num_scene_captures_completed} / {len(self.scene_capture_scenario_ids)}")
+        
+        self.mspids_completed.append(self.worker_mspids[wid])
+        self.log("info", f"Num. Captures Completed: {len(self.mspids_completed)} / {len(self.mspids)}")
         
         worker.reset()
-        # worker.b_need_new_scenario = True
+        self.worker_mspids.pop(wid)
 
-        if self.num_scene_captures_not_started > 0:
-            self.scene_capture_worker_idx[wid] = len(self.scene_capture_scenario_ids) - self.num_scene_captures_not_started
-            self.num_scene_captures_not_started -= 1 # This line comes after we set the idx
-            scenario_id = self.scene_capture_scenario_ids[self.scene_capture_worker_idx[wid]]
+        # Check if done creating scene captures
+        if self.num_mspids_remaining() > 0:
+            self.worker_mspids[wid] = self.get_next_mspid()
+            scenario_id = self.worker_mspids[wid]
             self.run_scenario_for_scene_capture(wid, scenario_id)
+            return
         else:
-            self.scene_capture_worker_idx.pop(wid)
             self.log("info", f"Worker {wid} done with scene capture")
         
-        if self.num_scene_captures_completed == len(self.scene_capture_scenario_ids):
+        if len(self.mspids_completed) == len(self.mspids):
             self.mode[self.MODE_SCENE_CAPTURE] = False
             self.log("info", f"Done with scene capture mode")
 
@@ -3160,15 +3714,29 @@ class BACRE2DAstarTrav(AutoSceneGenClient):
         """Overriden function from AutoSceneGenClient. Will be called automatically from AutoSceneGenClient.main_loop_timer_cb().
         Call the appropriate function based on the current mode of operation.
         """
-        self.b_done_testing = not self.mode[self.MODE_BACRE] and not self.mode[self.MODE_REPLAY] and not self.mode[self.MODE_RANDOM] and not self.mode[self.MODE_SCENE_CAPTURE]
+        self.b_done_testing = not self.mode[self.MODE_BACRE] and not self.mode[self.MODE_REPLAY] and not self.mode[self.MODE_RANDOM] and not self.mode[self.MODE_CGA] and not self.mode[self.MODE_SCENE_CAPTURE]
         if self.b_done_testing:
             self.log("info", "Done testing")
             return
 
-        worker : ASGWorkerRef = self.workers[wid]
+        worker : BACREWorkerRef = self.workers[wid]
 
         # Worker must be registered
         if not worker.b_registered_with_asg_client:
+            return
+
+        # Check if the worker stopped receiving RunScenario requests
+        if wid in self.worker_mspids.keys() and worker.num_resubmission_attempts >= 2:
+            self.log("info", f"Worker {wid} stopped receiving RunScenario requests. Ignoring worker.")
+            self.worker_mspids.pop(wid)
+
+            # Only reset the worker if this one case holds, otherwise BACRE can't finish creating the initial population
+            if self.mode[self.MODE_BACRE] and worker.b_running_base_scenario:
+                self.log("info", f"Resetting Worker {wid} so BACRE can create initial population.")
+                worker.reset()
+
+        # Ignore worker if it stopped receiving RunScenario requests
+        if worker.num_resubmission_attempts >= 2:
             return
         
         # Scene capture mode
@@ -3176,10 +3744,22 @@ class BACRE2DAstarTrav(AutoSceneGenClient):
             self.run_scene_capture_step(wid)
             return
         
+        # Comes AFTER scene capture mode, since we don't need any vehicle nodes for scene captures
+        # Check if any vehicle nodes unregistered while running a scenario
+        if wid in self.worker_mspids.keys() and len(worker.registered_vehicle_nodes) != self.num_vehicle_nodes:
+            self.log("info", f"A vehicle node for Worker {wid} unregistered while running a scenario. Resetting worker.")
+            worker.reset()
+            self.worker_mspids.pop(wid)
+        
+        # Continuous GA mode
+        if self.mode[self.MODE_CGA]:
+            self.run_cga_step(wid)
+            return
+        
         if len(worker.registered_vehicle_nodes) != self.num_vehicle_nodes:
             return
 
-        # Adversarial mode
+        # BACRE mode
         if self.mode[self.MODE_BACRE]:
             self.run_bacre_step(wid)
 
@@ -3191,16 +3771,17 @@ class BACRE2DAstarTrav(AutoSceneGenClient):
         elif self.mode[self.MODE_RANDOM]:
             self.run_random_step(wid)
 
+
 def main(args=None):
     # Place the main directory inside the src folder
     path_prefix = os.getcwd()
     if "/src" not in path_prefix:
         path_prefix = os.path.join(path_prefix, "src")
     path_prefix = os.path.join(path_prefix, "bacre_data", 'astar_trav_2D', f"iterative_experiments")
-    main_dir = os.path.join(path_prefix, "sunyaw0_rcr0.05_av3") # Folder for storing all data w.r.t. an individual experiment
+    main_dir = os.path.join(path_prefix, "sunyaw0_rcr0.05_av4_run1") # Folder for storing all data w.r.t. an individual experiment
 
     if not os.path.isdir(main_dir):
-        os.makedirs(main_dir)
+        os.makedirs(main_dir) 
 
     ssa_config = [
         StructuralSceneActorConfig(blueprint_directory="/Game/Blueprints/Structural_Scene_Actors/Trees", blueprint_name="BP_SSA_Tree_Juniper_Rocky_Mountain_Field_Desktop", num_instances=6, max_scale=1., ssa_type="tree"),
@@ -3239,7 +3820,7 @@ def main(args=None):
     )
 
     astar_path_planner_dict = {
-        'env_size': landscape_size, # Gets filled in by ASG
+        'env_size': landscape_size,
         'border_size': 0.,
         'minor_cell_size': 0.25,
         'major_cell_size': 0.5,
@@ -3299,21 +3880,18 @@ def main(args=None):
         "num_workers": 12,                      # Number of AutoSceneGenWorkers
         "base_wid": 0,                          # Base (lowest) AutoSceneGenWorker ID
         "local_wids": list(range(6)),
-        "worker_class": ASGWorkerRef,            # Class of type AutoSceneGenWorker, used to instantiate the worker references
+        "worker_class": BACREWorkerRef,            # Class of type AutoSceneGenWorker, used to instantiate the worker references
         "scenario_builder": scenario_builder,
     }
-
-    # Replay request options
-    # 1. Replay range of rankings: {'request': 'rankings', 'rank_range': [1,10], 'num_replays': 4}
-    # 2. Replay scenario or rankings from different experiment (with same parameters): {..., 'dir': '../exp2'}
     
     bacre_dict = {
-        "mode": BACRE2DAstarTrav.MODE_ANALYSIS_REPLAY,         # Modes of operation: training, inference, replay, replay_from_dir, random
-        "replay_request": {"request": "rankings", "rank_range": [1,10], "num_replays": 3}, # Replay request
+        "mode": BACRE2DAstarTrav.MODE_BACRE,         # Modes of operation
         "num_runs_per_scenario": 3,          # Number of times we run each scenario for to predict the difficulty for the test vehicle
         "num_base_env": 200,                               # Number of base or "seed" environments to create
         "num_env_to_generate": 5000,                       # Number of new environments to generate per iteration
-        "initial_prob_editing_random_env": 0.1, # .5
+        "num_mutations": 1,
+        "b_regret_uses_equivalent_x_errors": True,
+        "initial_prob_editing_random_env": 0.1, # .5,
         "prob_editing_random_env": 0.1,                 # Probability of choosing a random parent environment to edit (over all generated levels)
         "upper_search_quantile": 0.01,                   # Specifies the upper quantile of high-regret scenarios from which to randomly choose from
         "initial_regret_curation_ratio": 0.05, # .5             # Specifies the initial regret curation ratio
@@ -3325,18 +3903,44 @@ def main(args=None):
         "ssa_perturb_prob": 0.4,
         "data_save_freq": 100,                            # Save data manager at this frequency of generated scenarios
         "num_difficult_scenarios_to_plot": 50,           # Number of most difficult scenarios to plot
+        "cga_population_size": 200,
+        "cga_num_families_per_population": 10,
+        "cga_num_populations": 25,
+        "cga_mutation_prob": 0.2,
         "scene_capture_settings": scene_capture_settings,
         "scene_capture_request": BACRE2DAstarTrav.SCR_BEST_FAMILY_TREE,
         "scene_capture_request_value": 50,
+        "replay_request_rank_range": [1,10],
+        "replay_request_num_replays": 3,
     }
 
     b_plot_group_summary = False
     group_summary_prefix = "bacre_rand"
-    group_summary_dict = {
-        "BACRE": (("sunyaw0_rcr0.05_av4_run1", "sunyaw0_rcr0.05_av4_run2", "sunyaw0_rcr0.05_av4_run3", "sunyaw0_rcr0.05_av4_run4", "sunyaw0_rcr0.05_av4_run5"), "blue"),
-        "BACRE w/Annealing": (("sunyaw0_rcr0.05_anneal_av4_run1", "sunyaw0_rcr0.05_anneal_av4_run2", "sunyaw0_rcr0.05_anneal_av4_run3", "sunyaw0_rcr0.05_anneal_av4_run4", "sunyaw0_rcr0.05_anneal_av4_run5"), "green"),
-        # "BACRE w/ROI": (("sunyaw0_rcr0.05_roi5_av4_run1", "sunyaw0_rcr0.05_roi5_av4_run2", "sunyaw0_rcr0.05_roi5_av4_run3", "sunyaw0_rcr0.05_roi5_av4_run4"), "orange"),
+    group_summary_dict = { # Key = Experiment Name, Value = (list of experiment folders, color)
         "Random": (("sunyaw0_rand_av4_run1", "sunyaw0_rand_av4_run2", "sunyaw0_rand_av4_run3", "sunyaw0_rand_av4_run4", "sunyaw0_rand_av4_run5"), "red"),
+        "BACRE": (("sunyaw0_rcr0.05_av4_run1", "sunyaw0_rcr0.05_av4_run2", "sunyaw0_rcr0.05_av4_run3", "sunyaw0_rcr0.05_av4_run4", "sunyaw0_rcr0.05_av4_run5"), "blue"),
+        "BACRE w/\nAnnealing": (("sunyaw0_rcr0.05_anneal_av4_run1", "sunyaw0_rcr0.05_anneal_av4_run2", "sunyaw0_rcr0.05_anneal_av4_run3", "sunyaw0_rcr0.05_anneal_av4_run4", "sunyaw0_rcr0.05_anneal_av4_run5"), "green"),
+        "BACRE w/\n3 Mutations": (("sunyaw0_rcr0.05_edits3_av4_run1", "sunyaw0_rcr0.05_edits3_av4_run2", "sunyaw0_rcr0.05_edits3_av4_run3", "sunyaw0_rcr0.05_edits3_av4_run4", "sunyaw0_rcr0.05_edits3_av4_run5"), "black"),
+        "BACRE w/\nAnnealing + NEET": (("sunyaw0_rcr0.05_no-equiv-error_anneal_av4_run1","sunyaw0_rcr0.05_no-equiv-error_anneal_av4_run2", "sunyaw0_rcr0.05_no-equiv-error_anneal_av4_run3", "sunyaw0_rcr0.05_no-equiv-error_anneal_av4_run4", "sunyaw0_rcr0.05_no-equiv-error_anneal_av4_run5"), "orange"),
+    }
+
+    b_plot_cga_group_summary = False
+    cga_group_summary_dict = { # Key = Experiment Name, Value = (list of experiment folders, color)
+        "CGA (6 Obstacles)": (("sunyaw0_rcr0.05_cga_tree3_bush3_av4_run1", "sunyaw0_rcr0.05_cga_tree3_bush3_av4_run2", "sunyaw0_rcr0.05_cga_tree3_bush3_av4_run3", "sunyaw0_rcr0.05_cga_tree3_bush3_av4_run4", "sunyaw0_rcr0.05_cga_tree3_bush3_av4_run5"), "blue"),
+        "CGA (12 Obstacles)": (("sunyaw0_rcr0.05_cga_tree6_bush6_av4_run1", "sunyaw0_rcr0.05_cga_tree6_bush6_av4_run2", "sunyaw0_rcr0.05_cga_tree6_bush6_av4_run3", "sunyaw0_rcr0.05_cga_tree6_bush6_av4_run4", "sunyaw0_rcr0.05_cga_tree6_bush6_av4_run5"), "red"),
+    }
+
+    b_make_group_summary_log = False
+    group_summary_log_prefix = "bacre_rand_cga"
+    regret_thresholds = (0.375, 0.5, 0.75, 1.)
+    group_summary_log_dict = {
+        "Random": ("sunyaw0_rand_av4_run1", "sunyaw0_rand_av4_run2", "sunyaw0_rand_av4_run3", "sunyaw0_rand_av4_run4", "sunyaw0_rand_av4_run5"),
+        "BACRE": ("sunyaw0_rcr0.05_av4_run1", "sunyaw0_rcr0.05_av4_run2", "sunyaw0_rcr0.05_av4_run3", "sunyaw0_rcr0.05_av4_run4", "sunyaw0_rcr0.05_av4_run5"),
+        "BACRE w/Annealing": ("sunyaw0_rcr0.05_anneal_av4_run1", "sunyaw0_rcr0.05_anneal_av4_run2", "sunyaw0_rcr0.05_anneal_av4_run3", "sunyaw0_rcr0.05_anneal_av4_run4", "sunyaw0_rcr0.05_anneal_av4_run5"),
+        "BACRE w/3 Mutations": ("sunyaw0_rcr0.05_edits3_av4_run1", "sunyaw0_rcr0.05_edits3_av4_run2", "sunyaw0_rcr0.05_edits3_av4_run3", "sunyaw0_rcr0.05_edits3_av4_run4", "sunyaw0_rcr0.05_edits3_av4_run5"),
+        "BACRE w/Annealing + NEET": ("sunyaw0_rcr0.05_no-equiv-error_anneal_av4_run1","sunyaw0_rcr0.05_no-equiv-error_anneal_av4_run2", "sunyaw0_rcr0.05_no-equiv-error_anneal_av4_run3", "sunyaw0_rcr0.05_no-equiv-error_anneal_av4_run4", "sunyaw0_rcr0.05_no-equiv-error_anneal_av4_run5"),
+        "CGA (6 Obstacles)": ("sunyaw0_rcr0.05_cga_tree3_bush3_av4_run1", "sunyaw0_rcr0.05_cga_tree3_bush3_av4_run2", "sunyaw0_rcr0.05_cga_tree3_bush3_av4_run3", "sunyaw0_rcr0.05_cga_tree3_bush3_av4_run4", "sunyaw0_rcr0.05_cga_tree3_bush3_av4_run5"),
+        "CGA (12 Obstacles)": ("sunyaw0_rcr0.05_cga_tree6_bush6_av4_run1", "sunyaw0_rcr0.05_cga_tree6_bush6_av4_run2", "sunyaw0_rcr0.05_cga_tree6_bush6_av4_run3", "sunyaw0_rcr0.05_cga_tree6_bush6_av4_run4", "sunyaw0_rcr0.05_cga_tree6_bush6_av4_run5"),
     }
 
     def all_elements_are_numbers(data):
@@ -3358,7 +3962,7 @@ def main(args=None):
             else:
                 file.write(f"- {key}: {value}\n")
 
-    # Write parameters to txt file.
+    # Write parameters to txt file
     if not os.path.exists(os.path.join(main_dir, "parameters.txt")):
         parameters_file = os.path.join(main_dir, "parameters.txt") # Original parameters get written here, in case we need to refer back to them
     else:
@@ -3367,33 +3971,44 @@ def main(args=None):
         f.write("#################### AutoSceneGenClient Paremters: ####################\n")
         write_dict_to_txt(f, auto_scene_gen_client_dict)
         
-        f.write("\n#################### Adversarial Scene Gen Paremters: ####################\n")
+        f.write("\n#################### BACRE Paremters: ####################\n")
         write_dict_to_txt(f, bacre_dict)
         f.write("\n")
 
     scenario_builder.log_parameters_to_file(parameters_file)
 
     rclpy.init(args=args)
-    asg = BACRE2DAstarTrav(auto_scene_gen_client_dict, **bacre_dict)
+    node = BACRE2DAstarTrav(auto_scene_gen_client_dict, **bacre_dict)
+
+    executor = rclpy.executors.MultiThreadedExecutor(num_threads=2) # Use multithreaded executor so we can allow for service calls to execute while main loop is calculting optimal trajectories
+    executor.add_node(node)
 
     # By placing the spin() call in a try-except-finally block if the user presses ctrl-c, we can buy enough time to have the AutoSceneGenClient
     # publish its updated status to all workers.
     try:
-        # asg.make_main_figure_plots()
+        # node.make_main_figure_plots()
+        b_spin = True
         if b_plot_group_summary:
-            asg.plot_group_summary(group_summary_dict, group_summary_prefix)
-        else:
-            while rclpy.ok():
-                rclpy.spin_once(asg)
-                if asg.b_done_testing:
+            node.plot_group_summary(group_summary_dict, group_summary_prefix, num_legend_cols=3, legend_fontsize=12)
+            b_spin = False
+        if b_plot_cga_group_summary:
+            node.plot_cga_group_summary(cga_group_summary_dict)
+            b_spin = False
+        if b_make_group_summary_log:
+            node.group_summary_logging(group_summary_log_dict, regret_thresholds, group_summary_log_prefix)
+            b_spin = False
+        if b_spin:
+            while executor.context.ok():
+                executor.spin_once()
+                if node.b_done_testing:
                     break
     except KeyboardInterrupt:
-        asg.log("info", "Keyboard interrupt. Shutting down...")
+        node.log("info", "Keyboard interrupt. Shutting down...")
     except Exception as e:
-        asg.log("error", f"EXCEPTION: {traceback.format_exc()}") # Print entire exception and source of problem
+        node.log("error", f"EXCEPTION: {traceback.format_exc()}") # Print entire exception and source of problem
     finally:
-        asg.shutdown()
-        asg.destroy_node()
+        node.shutdown()
+        node.destroy_node()
         rclpy.shutdown()
 
 if __name__ == "__main__":

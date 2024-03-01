@@ -8,6 +8,7 @@ import copy
 from typing import Tuple, List, Dict
 
 import rclpy
+import rclpy.callback_groups
 import rclpy.node
 from auto_scene_gen_core.scenario_builder import AutoSceneGenScenarioBuilder
 
@@ -41,6 +42,7 @@ class AutoSceneGenWorkerRef:
         self.b_vehicle_nodes_can_run = False
         self.vehicle_node_save_dir = None
         self.b_save_minimal = True
+        self.num_resubmission_attempts = 0
 
         self.b_vehicle_node_requested_rerun = False
         self.num_rerun_requests = 0
@@ -51,7 +53,8 @@ class AutoSceneGenWorkerRef:
         self.ue_run_scenario_request = None # UE RunScenario request to be sent to the AutoSceneGenWorker
         self.run_scenario_future_response = None
         self.analyze_scenario_request = None # AnalyzeScenario request from the AutoSceneGenWorker
-        self.b_waiting_for_analyze_scenario_request = True
+        self.b_waiting_for_analyze_scenario_request = False
+        self.b_ignore_analyze_scenario_request = False
         self.b_analyzed_scenario = False
 
     def set_offline(self, duration_to_subtract: float):
@@ -62,13 +65,21 @@ class AutoSceneGenWorkerRef:
         """
         self.status = auto_scene_gen_msgs.StatusCode.OFFLINE
         self.b_registered_with_asg_client = False
-        self.b_waiting_for_analyze_scenario_request = True
+        self.b_waiting_for_analyze_scenario_request = False
+        self.b_ignore_analyze_scenario_request = True # Set to True just in case the client tries to make a request when the connection is reset
         self.b_received_run_scenario_request = False
         self.b_running_scenario = False
+
         if self.run_scenario_submit_time is None:
             self.run_scenario_submit_time = time.time() - duration_to_subtract
         else:
             self.run_scenario_submit_time -= duration_to_subtract
+        
+        self.num_resubmission_attempts = 0
+
+    def reset(self):
+        """Custom reset function you can override. Will be automatically called once all vehicle nodes are registered."""
+        pass
 
 
 class AutoSceneGenClient(rclpy.node.Node):
@@ -152,8 +163,12 @@ class AutoSceneGenClient(rclpy.node.Node):
             self.run_scenario_clis[wid] = self.create_client(auto_scene_gen_srvs.RunScenario, f"/asg_worker{wid}/services/run_scenario")
 
         # ROS timers
-        self.main_loop_timer = self.create_timer(0.01, self.main_loop_timer_cb)
+        self.main_loop_cb_group = rclpy.callback_groups.MutuallyExclusiveCallbackGroup()
+        self.main_loop_timer = self.create_timer(0.01, self.main_loop_timer_cb, callback_group=self.main_loop_cb_group)
         self.main_loop_wid = self.base_wid
+        self.utility_loop_timer = self.create_timer(0.01, self.utility_loop_timer_cb)
+
+        self.b_shutting_down = False
         
         self.log("info", "Initialized AutoSceneGenClient")
         self.log("info", "-" * 60, b_log_ros=False)
@@ -203,12 +218,13 @@ class AutoSceneGenClient(rclpy.node.Node):
         """
         msg = auto_scene_gen_msgs.VehicleNodeOperatingInfo()
         for wid,worker in self.workers.items():
-            msg.worker_ids.append(worker.wid)
-            msg.scenario_numbers.append(worker.scenario_number)
-            msg.ok_to_run.append(worker.b_vehicle_nodes_can_run)
-            save_dir = worker.vehicle_node_save_dir if worker.vehicle_node_save_dir is not None else ""
-            msg.save_dirs.append(save_dir)
-            msg.save_minimal.append(worker.b_save_minimal)
+            if worker.wid != self.main_loop_wid:
+                msg.worker_ids.append(worker.wid)
+                msg.scenario_numbers.append(worker.scenario_number)
+                msg.ok_to_run.append(worker.b_vehicle_nodes_can_run)
+                save_dir = worker.vehicle_node_save_dir if worker.vehicle_node_save_dir is not None else ""
+                msg.save_dirs.append(save_dir)
+                msg.save_minimal.append(worker.b_save_minimal)
         self.vehicle_node_operating_info_pub.publish(msg)
 
     def publish_scene_descriptions(self):
@@ -216,7 +232,7 @@ class AutoSceneGenClient(rclpy.node.Node):
         so that vehicle node plots can include the true scene description.
         """
         for wid,worker in self.workers.items():
-            if worker.run_scenario_request is not None:
+            if worker.wid != self.main_loop_wid and worker.run_scenario_request is not None:
                 self.scene_description_pubs[wid].publish(worker.run_scenario_request.scene_description)
 
     def process_worker_status_msg(self, wid: int, msg: auto_scene_gen_msgs.StatusCode):
@@ -248,11 +264,17 @@ class AutoSceneGenClient(rclpy.node.Node):
         if worker.status == auto_scene_gen_msgs.StatusCode.ONLINE_AND_RUNNING and worker.b_received_run_scenario_request:
             worker.b_running_scenario = True
 
-    def submit_run_scenario_request(self, wid: int, b_reset_num_rerun_requests: bool = True, b_convert_for_ue: bool = True):
+    def submit_run_scenario_request(self, 
+                                    wid: int, 
+                                    b_resubmission_attempt: bool = False,
+                                    b_reset_num_rerun_requests: bool = True, 
+                                    b_convert_for_ue: bool = True):
         """Submit a RunScenario request to specified worker.
         
         Args:
             - wid: Worker ID
+            - b_resubmission_attempt: Indicates if this is an attempt to resubmit the RunScenario request because the worker did not receive it.
+                                      If this flag is True, then the other booleans flags are ignored. Default is False.
             - b_reset_num_rerun_requests: Indicates if we should reset the number of rerun requests. Default is True.
             - b_convert_for_ue: Indicates if we should convert the RunScenario request to the UE equivalent. Default is True.
         """
@@ -260,46 +282,21 @@ class AutoSceneGenClient(rclpy.node.Node):
 
         if not worker.b_registered_with_asg_client:
             return
-
-        if worker.run_scenario_request is not None:
-            worker.scenario_number += 1
-            if b_convert_for_ue:
-                worker.ue_run_scenario_request = self.scenario_builder.get_unreal_engine_run_scenario_request(worker.run_scenario_request)
-            else:
-                worker.ue_run_scenario_request = worker.run_scenario_request
-            worker.ue_run_scenario_request.scenario_number = worker.scenario_number
-
-            # Do not clear list of ready vehicle nodes if the current request is only for scene captures
-            if not worker.run_scenario_request.scene_capture_only:
-                worker.ready_vehicle_nodes.clear()
-            
-            worker.b_received_run_scenario_request = False
-            worker.b_waiting_for_analyze_scenario_request = True
-            worker.analyze_scenario_request = None
-            worker.b_analyzed_scenario = False
-            worker.run_scenario_submit_time = time.time()
-            worker.run_scenario_future_response = self.run_scenario_clis[wid].call_async(worker.ue_run_scenario_request)
-            worker.b_running_scenario = False
-            worker.b_vehicle_node_requested_rerun = False
-
-            if b_reset_num_rerun_requests:
-                worker.num_rerun_requests = 0
-
-            self.log("info", f"Submitted RunScenario request: Worker {wid} / Scenario {worker.scenario_number}")
-
-    def resubmit_run_scenario_request(self, wid: int):
-        """Resubmit RunScenario request to specified worker.
         
-        Args:
-            - wid: Worker ID
-        """
-        worker = self.workers[wid]
-
         # If scenario number is 0, then it means the worker informed us that rosbridge was interrupted
-        if not worker.b_registered_with_asg_client or worker.scenario_number == 0:
+        if b_resubmission_attempt and worker.scenario_number == 0:
             return
 
         if worker.run_scenario_request is not None:
+            if not b_resubmission_attempt:
+                worker.scenario_number += 1
+            
+                if b_convert_for_ue:
+                    worker.ue_run_scenario_request = self.scenario_builder.get_unreal_engine_run_scenario_request(worker.run_scenario_request)
+                else:
+                    worker.ue_run_scenario_request = worker.run_scenario_request
+                worker.ue_run_scenario_request.scenario_number = worker.scenario_number
+
             # Do not clear list of ready vehicle nodes if the current request is only for scene captures
             if not worker.run_scenario_request.scene_capture_only:
                 worker.ready_vehicle_nodes.clear()
@@ -312,12 +309,23 @@ class AutoSceneGenClient(rclpy.node.Node):
             worker.run_scenario_future_response = self.run_scenario_clis[wid].call_async(worker.ue_run_scenario_request)
             worker.b_running_scenario = False
             worker.b_vehicle_node_requested_rerun = False
+            worker.b_ignore_analyze_scenario_request = False # Only submitting a RunScenario request can reset this flag
 
-            self.log("info", f"Resubmitted RunScenario request: Worker {wid} / Scenario {worker.scenario_number}")
+            if b_resubmission_attempt:
+                worker.num_resubmission_attempts += 1
+                self.log("info", f"Resubmitted RunScenario request: Worker {wid} / Scenario {worker.scenario_number}")
+            else:
+                worker.num_resubmission_attempts = 0
+                if b_reset_num_rerun_requests:
+                    worker.num_rerun_requests = 0
+                self.log("info", f"Submitted RunScenario request: Worker {wid} / Scenario {worker.scenario_number}")
 
     def check_run_scenario_response_timer_cb(self):
         """Make sure the ASG workers received the RunScenario request"""
         for wid,worker in self.workers.items():
+            if worker.wid == self.main_loop_wid:
+                continue
+            
             if worker.run_scenario_future_response is not None:
                 if worker.run_scenario_future_response.done():
                     try:
@@ -341,7 +349,7 @@ class AutoSceneGenClient(rclpy.node.Node):
                     if now - worker.run_scenario_submit_time > self.WORKER_PROCESS_REQUEST_TIMEOUT:
                         if worker.scenario_number > 0 and worker.run_scenario_request is not None:
                             self.log("info", f"Worker {wid} exhausted timeout of {self.WORKER_PROCESS_REQUEST_TIMEOUT} seconds to process RunScenario request.")
-                        self.resubmit_run_scenario_request(wid)
+                        self.submit_run_scenario_request(wid, b_resubmission_attempt=True)
                         continue
 
     def cancel_submitting_run_scenario_request(self, wid: int):
@@ -365,8 +373,15 @@ class AutoSceneGenClient(rclpy.node.Node):
 
         worker = self.workers[wid]
         if request.scenario_number != worker.scenario_number:
-            self.log("warn", f"Expected Worker {wid} AnalyzeScenario Request with scenario number {worker.scenario_number} but received {request.scenario_number}.")
-            self.resubmit_run_scenario_request(wid)
+            self.log("warn", f"Expected Worker {wid} AnalyzeScenario Request with scenario {worker.scenario_number} but received {request.scenario_number}.")
+            self.submit_run_scenario_request(wid, b_resubmission_attempt=True)
+            response.received = False
+            return response
+        
+        if worker.b_ignore_analyze_scenario_request:
+            self.log("warn", f"Worker {wid} was flagged to ignore AnalyzeScenario request. Ignoring request for scenario {request.scenario_number}.")
+            worker.b_waiting_for_analyze_scenario_request = False
+            worker.run_scenario_submit_time = None # Sometimes the worker was not seen as running the scenario even though it was
             response.received = False
             return response
 
@@ -395,6 +410,7 @@ class AutoSceneGenClient(rclpy.node.Node):
             self.log("info", f"Registered vehicle node {request.node_name} for Worker {wid}")
 
             if len(worker.registered_vehicle_nodes) == self.num_vehicle_nodes:
+                worker.reset()
                 self.log("info", f"Worker {wid} vehicle nodes are all registered")
         else:
             self.log("info", f"Vehicle node {request.node_name} is already registered for Worker {wid}")
@@ -423,6 +439,7 @@ class AutoSceneGenClient(rclpy.node.Node):
             if request.node_name in worker.ready_vehicle_nodes:
                 worker.ready_vehicle_nodes.remove(request.node_name)
             worker.b_vehicle_nodes_can_run = False
+            worker.b_ignore_analyze_scenario_request = True
             self.log("info", f"Unregistered vehicle node {request.node_name} for Worker {wid}.") # Scenario will get resubmitted when it re-registers
 
         # Return response
@@ -500,20 +517,24 @@ class AutoSceneGenClient(rclpy.node.Node):
                 return False
         return True
 
-    def main_loop_timer_cb(self):
-        """This is the main loop that will run until the node is destroyed"""
+    def utility_loop_timer_cb(self):
+        """A callback that constantly performs basic utilities, except for the main_loop_wid worker to avoid any conflicts"""
         self.publish_online_status()
         self.publish_vehicle_node_operating_info()
         self.publish_scene_descriptions()
         self.check_run_scenario_response_timer_cb()
 
+    def main_loop_timer_cb(self):
+        """This is the main loop that will run until the node is destroyed"""
+        if self.b_shutting_down:
+            return
         self.main_step(self.main_loop_wid)
         self.main_loop_wid += 1
         if self.main_loop_wid == self.base_wid + self.num_workers:
             self.main_loop_wid = self.base_wid
 
     def main_step(self, wid: int):
-        """In your child class, put your code for running a single step for the given worker here. This function is automaticaly called by main_loop_timer_cb().
+        """In your child class, put your code for running a single step for the given worker here. This function is automatically called by main_loop_timer_cb().
         
         Args:
             - wid: Worker ID being processed
@@ -524,8 +545,9 @@ class AutoSceneGenClient(rclpy.node.Node):
         """Call this function immediately after rclpy.ok() returns False to properly shutdown this node. 
         Upon shutdown we need to send an offline signal to all AutoSceneGen workers and any other nodes relying on this node's status.
         """
-        self.log("info", "-" * 30 + 'SHUTDOWN' + "-" * 30, b_log_ros=False)
+        self.log("info", "-" * 30 + "SHUTDOWN" + "-" * 30, b_log_ros=False)
         self.log("info", f"Sending offline signal")
+        self.b_shutting_down = True
         for i in range(10):
             msg = auto_scene_gen_msgs.StatusCode()
             msg.status = auto_scene_gen_msgs.StatusCode.OFFLINE
