@@ -29,7 +29,7 @@ This process is effectively copied from the README in [auto_scene_gen](https://g
 
 1. Download the provided docker image or add all of its libraries to your Ubuntu system.
 2. Let's put all of our code in a common folder: `mkdir ~/auto_scene_gen_ws`
-3. Let's clone and build rosbridge_suite with the root ROS installation as the underlay
+3. Clone and build rosbridge_suite with the root ROS installation as an underlay
    ```
    cd ~/auto_scene_gen_ws/
    mkdir rosbridge_suite
@@ -38,7 +38,7 @@ This process is effectively copied from the README in [auto_scene_gen](https://g
    source /opt/ros/foxy/setup.bash
    colcon build
    ```
-4. Clone and build this repository with rosbridge_suite as the underlay:
+4. Clone and build this repository with rosbridge_suite as an underlay:
     ```
    cd ~/auto_scene_gen_ws/
    mkdir bacre_2D
@@ -48,7 +48,12 @@ This process is effectively copied from the README in [auto_scene_gen](https://g
    colcon build
    source install/setup.bash
     ```
-    This last step configures the `bacre_2D` workspace to be our final ROS overlay that we can source.
+
+The last step configures the `bacre_2D` workspace to be our final ROS overlay. We will then only need to source this overlay with
+```
+source ~/auto_scene_gen_ws/bacre_2D/install/setup.bash
+```
+before running our ROS code.
 
 ## Running the Experiments from the Paper
 
@@ -65,7 +70,7 @@ The experiments in the paper use a Polaris MRZR virtual vehicle model (if you do
 Now we need to attach the [sensors](https://github.com/tsender/AutomaticSceneGeneration/blob/main/Documentation/sensors.md). The vehicle in the experiments has a forward-facing camera and a localization sensor.
 - Open up your vehicle blueprint
 - Add the camera
-    - Add a CompleteCameraSensor at the location (150, 0, 140) centimeters relative to the mesh origin, with a zero roll, pitch, and yaw. Note, these coordinates are in the left-hand coordinate system.
+    - Add a CompleteCameraSensor at the location (150, 0, 140) centimeters relative to the mesh origin, with zero roll, pitch, and yaw. Note, these coordinates are in the left-hand coordinate system.
     - Set both the `Image Height` and `Image Width` to 256.
     - Set the `Frame Rate` to 15 Hz.
     - Check the `Enable Depth Cam` box to enable the depth camera.
@@ -118,16 +123,16 @@ Each level must have one of these actors. Simply add the actor to the World Outl
 
 #### ROSBridgeParamOverride
 
-Each level should have a ROSBridgeParamOverride actor so it can have its own dedicated rosbridge node. NOTE: all of the below fields are specific to the [feature/specify_ros_version](https://github.com/tsender/ROSIntegration/tree/feature/specify_ros_version) of @tsender's `ROSIntegration`fork.
+Each level should have a ROSBridgeParamOverride actor so it can have its own dedicated rosbridge node. NOTE: All of the below fields are specific to the [feature/specify_ros_version](https://github.com/tsender/ROSIntegration/tree/feature/specify_ros_version) branch of @tsender's `ROSIntegration`fork.
 
-- `ROSBridge Server Hosts`: TArray of IP addresses of the computer runnng rosbridge. Only use one IP for now.
-- `ROSBridge Server Ports`: TArray of port numbers that rosbridge is listening to (we used ports 9100 and above, but you can use another base port number). Only use a single port in this array for now.
+- `ROSBridge Server Hosts`: TArray of IP addresses of the computer running rosbridge. Each entry pairs with the corresponding element in the `ROSBridge Server Ports` array to define the servers. Only use one IP for now.
+- `ROSBridge Server Ports`: TArray of port numbers that rosbridge is listening to. Each entry pairs with the corresponding element in the `ROSBridge Server Hosts` array to define the servers. Only use a single port in this array for now.
 - `ROSVersion`: 2
 - `Clock Topic Name`: "/clock\<wid\>", where \<wid\> is replaced by the associated Worker ID
 
 ### UE4 Setup Part 2: Configuring Parallel Simulations
 
-Since most gaming desktops have a powerful GPU, it is expected that you will be able to run more than one UE editor at once. In our paper, we used 12 independent simulations across two Windows machines, each running six workers. To configure such a setup, first create one level following the above instructions. Save the level as "level_0" (you can use whatever naming conventon you like), as this level will be our first worker. Then, create $n$ copies of this level, "level_1", "level_2", ..., "level_n". Within level $i$, set the Worker ID as $i$, add the port $9100 + i$ to the `ROSBridge Server Ports` array, and set the `Clock Topic Name` (for level 0 this will be "/clock0").
+Since most modern gaming desktops are quite powerful, it is expected that you will be able to run more than one UE editor at once. In our paper, we used 12 independent simulations across two Windows machines, each running six workers. To configure such a setup, first create one level following the above instructions. Save the level as "level_0" (you can use whatever naming conventon you like), as this level will be our first worker. Then, create $n$ copies of this level, "level_1", "level_2", ..., "level_n". Within level $i$, set the Worker ID as $i$, add the port $9100 + i$ to the `ROSBridge Server Ports` array, and set the `Clock Topic Name` (for level 0 this will be "/clock0").
 
 Note: Regardless of how you split up the independent simulations, every active level must have a different Worker ID associated with it (as duplicates will cause problems). Also, all IDs should be consecutive, regardless of the lowest ID you start at. For example, 0,1,2,...,11 or 10,11,12,...,21 are acceptable IDs for using 12 parallel workers.
 
@@ -135,23 +140,23 @@ Note: Regardless of how you split up the independent simulations, every active l
 
 #### Autonomy System
 
-The experiments in the paper used multiple variations of a custom autonomy system with a DNN-based perception system classifying image pixels as being part of a traversable or non-traversable object, or to the sky. The dataset is in the folder `astar_trav/Datasets_256x256/NoClouds_Trees_Bushes_SunIncl0-15-30-45-60-75-90`, the network is defined in the `semseg_networks.py`file, the training and prediction code is in the `semantic_segmentation.py` file, and the model used is in the subfolder `models/small_v2`. The dataset contains roughly 300-500 images of scenes with the sun at an inclination angle of 0 to 90 degrees in 15 degree increments. The path planner is an A* voting planner that adds votes to potential obstacle locations (the more votes, the more likely that vertex will be avoided in the planning stage) which affect the edge cost in an A* planner. Then a path follower tracks the latest A* path at a constant speed using a PD controller for steering. The autonomsy system is developed entirely in Python and can be found in the `astar_trav` package.
+The experiments in the paper used multiple variations of a custom autonomy system developed entirely in Python and can be found in the `astar_trav` package. A DNN-based perception system classifies image pixels as being part of a traversable or non-traversable object, or to the sky. The dataset is in the folder `astar_trav/Datasets_256x256/NoClouds_Trees_Bushes_SunIncl0-15-30-45-60-75-90`, the network is defined in the `astar_trav/semseg_networks.py`file, the training and prediction code is in the `astar_trav/semantic_segmentation.py` file, and the model used is in the folder `astar_trav/Datasets_256x256/NoClouds_Trees_Bushes_SunIncl0-15-30-45-60-75-90/models/small_v2`. The dataset contains roughly 300-500 images of scenes per inclination angle of the sun from 0 to 90 degrees in 15 degree increments. The path planner is an A* voting planner that adds votes to potential obstacle locations (the more votes, the more likely that vertex will be avoided in the planning stage) which affect the edge cost in an A* planner. Then a path follower tracks the latest A* path at a constant speed using a PD controller for steering. 
 
-There are two implementations of the autonomy system. Version 1 consists of two nodes, defined in the files `astar_trav_2D_all_in_on_node.py` (for the A* mapping and planning) and `simple_path_follower_node.py` (for control). In version 2, the A* mapping and planning operations were split into separate nodes, defined in `astar_trav_2D_mapping_node.py` and `astar_trav_2D_planning_node.py`, respectively. Creating this second version also required creating custom messages which are defined in the `astar_trav_msgs` package.
+There are two implementations of the autonomy system. Version 1 consists of two nodes, defined in the files `astar_trav/astar_trav_2D_all_in_on_node.py` (for the A* mapping and planning) and `astar_trav/simple_path_follower_node.py` (for control). In version 2, the A* mapping and planning operations were split into separate nodes, defined in `astar_trav/astar_trav_2D_mapping_node.py` and `astar_trav/astar_trav_2D_planning_node.py`, respectively. Creating this second version also required creating custom messages which are defined in the `astar_trav_msgs` package.
 
 Choose a version of the autonoy system to run, `v1` or `v2`, and then modify the parameters in the `main()` function at the bottom of each of the above-mentioned files. Then build the packages with `colcon build` for the changes to take effect.
 
 #### BACRE Node
 
-The BACRE node used in the experiments is defined in the `adversarial_scene_gen/bacre_2D_astar_trav_node.py` file. This file defines a number of child classes for the `auto_scene_gen` interface, as well as some custom classes needed for general operation. This is a very long file, but almost everything should be well-commented. Here is a brief description of some of the main objects defined in this file:
+The BACRE node used in the experiments is defined in the `adversarial_scene_gen/bacre_2D_astar_trav_node.py` file. This file defines a number of child classes for the `auto_scene_gen` interface, as well as some custom classes needed for general operation. This is a very big file, but almost everything should be well-commented. Here is a brief description of some of the main classes defined in this file:
 - `ScenarioOutcome`: Stores information regarding the outcome of a single run/trial for a scenario.
 - `Scenario`: Stores information about all the outcomes for running a particular scenario.
 - `ScenarioBuilderAndRefAgent`: The customized scenario builder and reference agent for BACRE. A child class of `auto_scene_gen_core/AutoSceneGenScenarioBuilder`.
 - `BACREWorkerRef`: A customized class that stores information and the status for a given worker. A child class of `auto_scene_gen_core/AutoSceneGenWorkerRef`.
-- `ScenarioRegretManager`: A class for storing the scenario regrets in a single place, along with some other high-level relevant information. This class makes it quicker to access this data so we don't have to load all of the scenarios into memory each time.
-- `BACRE2DAstarTrav`: The BACRE node class, which is a child class of `auto_scene_gen_core/AutoSceneGenWorkerRef`.
+- `ScenarioRegretManager`: A class for storing the scenario regrets in a single place, along with some other high-level relevant information. This class makes it easy to store and quickly access this data so we don't have to load all of the scenarios into memory each time.
+- `BACRE2DAstarTrav`: The BACRE node class, which is a child class of `auto_scene_gen_core/AutoSceneGenClient`.
 
-The `main()` function is the access point for running the node and defines all of the parameters needed by the node and various objects. The BACRE2DAstarTravnode can be put into several modes of operation:
+The `main()` function is the access point for running the node and defines all of the parameters needed by the node and various objects. The BACRE2DAstarTrav node can be put into several modes of operation:
 - `MODE_BACRE`: Will run the BACRE algorithm to generate adversarial scenarios
 - `MODE_RANDOM`: Will generate random scenarios
 - `MODE_CGA`: Will use a continuous Genetic Algorithm (CGA) to generate adversarial scenarios
@@ -187,8 +192,8 @@ NOTE: It is assumed that each ROS command is being executed from the directory `
         ```
 4. Run the ROS autonomy stacks (we will use version v2 in this example)
     - A few things to keep in mind:
-        1. Each autonomy stack should be run inside its OWN docker container using its OWN set of dedicated CPU cores. No two autonomy stacks should be using the same CPU cores. In our experience, allowing all the autonomy stacks to run on any available CPU core created problems due to the large overhead with the current ROS2 execution model. Consequently, all node callbacks experienced a dramatic slow down and did not execute at the proper rates. Giving each autonomy stack its own set of physical CPU cores removed this problem and also allows for greater consistency across simulations.
-        2. All vehicle nodes need to know which computer they are running on relative to where the BACRE node (the controlling AutoSceneGenClient node) is running.
+        1. Each autonomy stack should be run inside its OWN docker container using its OWN set of dedicated CPU cores. No two autonomy stacks should be using the same CPU cores. In our experience, allowing all the autonomy stacks to run on any available CPU core created problems due to the large overhead associated with the poorly designed ROS2 execution model. Consequently, all node callbacks experienced a dramatic slow down and did not execute at the proper rates. Giving each autonomy stack its own set of physical CPU cores removes this problem and also allows for greater consistency across simulations.
+        2. All vehicle nodes need to know which computer they are running on relative to where the controlling AutoSceneGenClient node (in this case, the BACRE node) is running.
     - Running an autonomy stack associated with ID \<wid\> on the same computer as the BACRE node:
         - Make a docker container, source the ROS overlay, and run
             ```
@@ -200,8 +205,8 @@ NOTE: It is assumed that each ROS command is being executed from the directory `
             ```
             ros2 launch astar_trav worker_astar_trav_2D_v2_launch.py wid:=<wid> asg_client_ip_addr:=<ip_addr>
             ```
-            where \<ip_addr\> is the IP address of the computer running the BACRE node (in our case, this is the IP address of computer 0). Autonomy stacks associated with IDs 6-11 are executed on computer 1 in our setup.
-    - To simplify the above commands, we created shell scripts that took just the ID as an argument. The script for running an autonomy stack on the local computer (computer 0) looked like:
+            where \<ip_addr\> is the IP address of the computer running the AutoSceneGenClient node (in our case, this is the IP address of computer 0). Autonomy stacks associated with IDs 6-11 are executed on computer 1 in our setup.
+    - To simplify the above commands, we created shell scripts that took just the worker ID as an argument. The script for running an autonomy stack on the local computer (computer 0) looked like:
         ```
         #! \usr/bin/bash
         wid=$1
