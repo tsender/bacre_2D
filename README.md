@@ -17,7 +17,7 @@ Note: For convenience, both `auto_scene_gen_*` packages have been copied directl
 
 If you use our work in an academic context, we would greatly appreciate it if you used the following citation:
 
-TODO
+Coming Soon
 
 ## Installation
 
@@ -168,6 +168,30 @@ The `main()` function is the access point for running the node and defines all o
 
 The current `main()` function shows how all of parameters were setup to run the experiments. There is also code for extracting additional data and making summary plots for the experiments that were conducted.
 
+### Experiment Parameters
+
+This section discusses where to find the parameters used to conduct the individual trials that make up the experiments in the paper.
+
+Four ROS autonomy systems were used, denoted AV 1-4. The parameters for the ROS nodes for each of these AV versions can be found in the [`experiment_parameters`](experiment_parameters) folder.
+
+The `main()` function in `adversarial_scene_gen/bacre_2D_astar_trav_node.py` lists the parameters used to conduct trials for the "BACRE" dataset for the paper's comparison experiment. The parameters used by the first experiment (the iterative design experiment) are the same as what is listed; the only changes were made to the autonomy system. The parameters used to conduct trials for the random and other BACRE datasets for the comparison experiment are as follows (only the fields within the `bacre_dict` dictionary are affected):
+- Random:
+  - `mode`: MODE_RANDOM
+- BACRE: No Changes, use parameters listed
+- BACRE w/Annealing:
+  - `initial_prob_editing_random_env`: 0.5
+  - `initial_regret_curation_ratio`: 0.5
+- BACRE w/3 Mutations:
+  - `num_mutations`: 3
+- BACRE w/Annealing + NEET:
+  - `b_regret_uses_equivalent_x_errors`: False
+  - `initial_prob_editing_random_env`: 0.5
+  - `initial_regret_curation_ratio`: 0.5
+
+The parameters used to conduct trials for the two continuous genetic algorithm (CGA) datasets in the comparison experiment use the `cga_` fields as listed in the `bacre_dict`, and set the `mode` to `MODE_CGA`. Configuring the CGA mode will tell the node to use those `cga_` arguments. Finally, since one of these CGA experiments used at most 3 trees and 3 bushes, you can set the `num_instances` field within the `StructuralSceneActorConfig` objects inside the `ssa_config` list (about 100 lines above `bacre_dict`).
+
+**NOTE:** Remember to create a new folder for each trial within an experiment group. The `main_dir` variable set at the top of the `main()` function is used to control where all the data gets saved to. This variable creates the following folder hierarchy: `src/bacre_data/iterative_experiments/<experiment_trial_name>/`.
+
 ### Running the Experiments
 
 At this point everything should now be ready to run the experiments. These instructions will follow the procedure we used (though you can easily adapt this for the computing resources in your own setup). 
@@ -219,6 +243,25 @@ NOTE: It is assumed that each ROS command is being executed from the directory `
         ros2 launch astar_trav worker_astar_trav_2D_v2_launch.py wid:=${wid} asg_client_ip_addr:=<computer0_ip_addr>
         ```
         where \<computer0_ip_addr\> was filled in appropriately.
+
+### Extracting Summary Data
+
+There are a few functions accessible from the `main()` function in `adversarial_scene_gen/bacre_2D_astar_trav_node.py` that can be used to create some of the summary data seen in the paper. All data will be saved to the folder: `src/bacre_data/iterative_experiments/summary/`. The following data extraction methods are provided:
+- Group Summary Plots
+  - Makes a plot of the regret vs. iterations and maximum regret vs. iterations as shown in Fig. 3(a) in the paper.
+  - Set `b_plot_group_summary` to `True`.
+  - Set the save prefix `group_summary_prefix` as desired. Data will be saved with the prefix `<group_summary_prefix>_`.
+  - Add entries to the `group_summary_dict` dictionary where the keys are the experiment name and the values are a tuple of (list of respective experiment trials, plot color).
+- CGA Summary Plots
+  - Makes a plot of the average regret vs. population and maximum regret vs. population as shown in Fig. 3(b) in the paper (specific for the CGA experiments). All data gets saved to with the prefix `cga_`.
+  - Set `b_plot_cga_group_summary` to `True`
+  - Add entries to the `cga_group_summary_dict` dictionary where the keys are the CGA experiment name and the values are a the tuple (list of respective CGA experiment trials, plot color).
+- Group Summary Log
+  - Extracts various statistics from the specified experiments, such as the data in Table III in the paper. Determines the fraction of scenarios/experiments whose regrets exceed various thresholds and when those thresholds are met, as well as what fraction of scenarios resulted in vehicle failure.
+  - Set `b_make_group_summary_log` to `True`
+  - Set the save prefix `group_summary_log_prefix` as desired. Data will be saved with the prefix `<group_summary_log_prefix>_`.
+  - Set the `regret_thresholds` variable to a list of regret thresholds.
+  - Add entries to the `group_summary_log_dict` dictionary where the keys are the experiment name and the values are a list of the respective experiment trials.
 
 ## Running Your Own Experiments
 

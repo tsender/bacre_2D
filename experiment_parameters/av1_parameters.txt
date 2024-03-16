@@ -1,0 +1,69 @@
+# Autonomy System 1 Parameters
+
+############################## Parameters (Version Changes) ##############################
+# 1.0 Use worker_astar_trav_2D_v1_launch.py
+
+############################## A* Trav (astar_trav/astar_trav_2D_all_in_one_node.py) ##############################
+semseg_dict = {
+    "mode": "prediction",
+    "data_dir": os.path.join(path_prefix, "astar_trav", "astar_trav", "Datasets_256x256", "NoClouds_Trees_Bushes_SunIncl0-15-30-45-60-75-90"),
+    "model_version": "small_v2",
+    "image_size": (256, 256, 3),
+    "semantic_color_map": semantic_color_map,
+    "create_network_func": semseg_networks.create_unet_network_small_v2,
+    "seg_folder_name": "trav"
+}
+
+path_planner_dict = {
+    "env_size": (60., 60.),
+    "border_size": 50.,
+    "minor_cell_size": 1.,
+    "major_cell_size": 2.,
+    "bell_curve_sigma": 2.5, # 2.5 in v1, 1.5 in v2-v4
+    "bell_curve_alpha": 1/50.,
+    "max_votes_per_vertex": 50,
+    "radius_threashold1": 3.,
+    "radius_threashold2": 6.,
+    "use_three_point_edge_cost": True,
+}
+
+# Sensor offsets and orientations w.r.t vehicle center
+cam_offset = np.array([1.5, 0., 1.4], dtype=np.float32)                           # Offset is (x, y, z) in [m]
+cam_orientation = np.array([0., 0., 0.], dtype=np.float32) * (math.pi / 180.)   # Orientation is (yaw, pitch, roll) in [rad] based on the ZYX sequence
+loc_offset = np.array([0., 0., 0.], dtype=np.float32)                           # Offset is (x, y, z) in [m]
+loc_orientation = np.array([0., 0., 0.], dtype=np.float32) * (math.pi / 180.)   # Orientation is (yaw, pitch, roll) in [rad] based on the ZYX sequence
+
+astar_trav_dict = {
+    "height_thresh": 2.,                                                            # Height threshold for depth data [m]
+    "waypoint_separation": -1,                                                      # (Deprecated) Used to distribute waypoints into a finer path    
+    "camera_hfov": 90. * (math.pi / 180.),                                          # Camera horizontal FOV [rad]
+    "veh2cam_transform": {"offset": cam_offset, "orientation": cam_orientation},    # Vehicle center to camera transform
+    "veh2loc_transform": {"offset": loc_offset, "orientation": loc_orientation},    # Vehicle center to localization sensor transform
+    "replan_path_timer_rate": 0.5,
+    "initial_sensor_proc_delay": 1.,
+    "b_use_vectorized_obstacle_vote_update": False,
+    "b_use_multithreaded_path_update": True,
+    "b_use_yaw_radius_threasholds": False,
+    "b_use_scene_description": False,
+    "ssa_to_ignore": [], # SSA_Tree
+    "nav_destination_topic_suffix": "/nav/destination",
+    "localization_topic_suffix": "/sensors/localization",
+    "color_cam_topic_suffix": "/sensors/camera/color_image",
+    "depth_cam_topic_suffix": "/sensors/camera/depth_image",
+    "waypoint_path_topic_suffix": "/nav/waypoint_path",
+    "expected_camera_frame_rate": 15.,
+}
+
+############################## Path Follower (astar_trav/simple_path_follower_node.py) ##############################
+pf_dict = {
+    'tracking_speed': 5., # [m/s]
+    'kp_steering': 10., # 10 in v1, 15 in v2
+    'kd_steering': 5,
+    'control_timer_rate': 20.,
+    'tracking_waypoint_method': 'look_ahead_distance',   # Options: waypoint_mixture_coeffs, look_ahead_distance
+    'waypoint_mixture_coeffs': [0.25, 0., 0.75], # Coeffs for [vehicle_position, closest_waypoint, next_closest_waypoint]
+    'look_ahead_distance': 5.,
+    'localization_topic_suffix': '/sensors/localization',
+    'waypoint_path_topic_suffix': '/nav/waypoint_path',
+    'vehicle_control_topic_suffix': '/control/physx'
+}

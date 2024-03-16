@@ -1,0 +1,97 @@
+# Autonomy System 4 Parameters
+
+############################## Parameters (Version Changes) ##############################
+# 1.0 Use worker_astar_trav_2D_v1_launch.py
+# 2.1 Use midpoint edge cost in A*
+# 2.2 Use smaller bell curve sigma from 2.5 to 1.5
+# 2.3 Use yaw radius threshold in A*
+# 3.1 Use vectorized obstacle update
+# 3.2 Separate A* mapping and planning into two nodes. Use worker_astar_trav_2D_v2_launch.py
+# 3.3 Increase Kp gain on steering control from 10 to 20
+# 4.1 Have A* generate new paths from look ahead prediction instead of current position (to help reduce switching behavior)
+
+############################## A* 2D Mapping (astar_trav/astar_trav_2D_mapping_node.py) ##############################
+semseg_dict = {
+    "mode": "prediction",
+    "data_dir": os.path.join(path_prefix, "astar_trav", "astar_trav", "Datasets_256x256", "NoClouds_Trees_Bushes_SunIncl0-15-30-45-60-75-90"),
+    "model_version": "small_v2",
+    "image_size": (256, 256, 3),
+    "semantic_color_map": semantic_color_map,
+    "create_network_func": semseg_networks.create_unet_network_small_v2,
+    "seg_folder_name": "trav"
+}
+
+path_planner_dict = {
+    "env_size": (60., 60.),
+    "border_size": 50.,
+    "minor_cell_size": 1.,
+    "major_cell_size": 2.,
+    "bell_curve_sigma": 1.5, # 2.5 in v1, 1.5 in v2-v4
+    "bell_curve_alpha": 1/50.,
+    "max_votes_per_vertex": 50,
+    "radius_threashold1": 3.,
+    "radius_threashold2": 6.,
+    "use_three_point_edge_cost": False,
+}
+
+# Sensor offsets and orientations w.r.t vehicle center
+cam_offset = np.array([1.5, 0., 1.4], dtype=np.float32)                           # Offset is (x, y, z) in [m]
+cam_orientation = np.array([0., 0., 0.], dtype=np.float32) * (math.pi / 180.)   # Orientation is (yaw, pitch, roll) in [rad] based on the ZYX sequence
+loc_offset = np.array([0., 0., 0.], dtype=np.float32)                           # Offset is (x, y, z) in [m]
+loc_orientation = np.array([0., 0., 0.], dtype=np.float32) * (math.pi / 180.)   # Orientation is (yaw, pitch, roll) in [rad] based on the ZYX sequence
+
+astar_trav_mapping_dict = {
+    "height_thresh": 2.,                                                            # Height threshold for depth data [m]
+    "camera_hfov": 90. * (math.pi / 180.),                                          # Camera horizontal FOV [rad]
+    "veh2cam_transform": {"offset": cam_offset, "orientation": cam_orientation},    # Vehicle center to camera transform
+    "veh2loc_transform": {"offset": loc_offset, "orientation": loc_orientation},    # Vehicle center to localization sensor transform
+    "initial_sensor_proc_delay": 1.,
+    "b_use_vectorized_obstacle_vote_update": True,
+    "nav_destination_topic_suffix": "/nav/destination",
+    "localization_topic_suffix": "/sensors/localization",
+    "color_cam_topic_suffix": "/sensors/camera/color_image",
+    "depth_cam_topic_suffix": "/sensors/camera/depth_image",
+    "map_state_topic_suffix": "/nav/map_state",
+    "expected_camera_frame_rate": 15.,
+}
+
+############################## A* 2D Planning (astar_trav/astar_trav_2D_planning_node.py) ##############################
+path_planner_dict = {
+    "env_size": (60., 60.),
+    "border_size": 50.,
+    "minor_cell_size": 1.,
+    "major_cell_size": 2.,
+    "bell_curve_sigma": 1.5, # 2.5 in v1, 1.5 in v2-v4
+    "bell_curve_alpha": 1/50.,
+    "max_votes_per_vertex": 50,
+    "radius_threashold1": 3.,
+    "radius_threashold2": 6.,
+    "use_three_point_edge_cost": False,
+}
+
+astar_trav_planning_dict = {
+    "waypoint_separation": -1,                                                      # (Deprecated) Used to distribute waypoints into a finer path    
+    "replan_path_timer_rate": 0.5,
+    "b_use_multithreaded_path_update": True,
+    "b_use_yaw_radius_threasholds": True,
+    "b_generate_path_from_look_ahead_prediction": True,
+    "look_ahead_distance": 5.,
+    "nav_destination_topic_suffix": "/nav/destination",
+    "localization_topic_suffix": "/sensors/localization",
+    "map_state_topic_suffix": "/nav/map_state",
+    "waypoint_path_topic_suffix": "/nav/waypoint_path",
+}
+
+############################## Path Follower (astar_trav/simple_path_follower_node.py) ##############################
+pf_dict = {
+    'tracking_speed': 5., # [m/s]
+    'kp_steering': 20., # 10 in v1, 20 in v3
+    'kd_steering': 5,
+    'control_timer_rate': 20.,
+    'tracking_waypoint_method': 'look_ahead_distance',   # Options: waypoint_mixture_coeffs, look_ahead_distance
+    'waypoint_mixture_coeffs': [0.25, 0., 0.75], # Coeffs for [vehicle_position, closest_waypoint, next_closest_waypoint]
+    'look_ahead_distance': 5.,
+    'localization_topic_suffix': '/sensors/localization',
+    'waypoint_path_topic_suffix': '/nav/waypoint_path',
+    'vehicle_control_topic_suffix': '/control/physx'
+}

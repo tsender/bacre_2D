@@ -2094,9 +2094,10 @@ class BACRE2DAstarTrav(AutoSceneGenClient):
                             iters.append(j+1)
                             break
                 num_iters_to_exceed = np.mean(iters)
+                exp_frac = len(iters) / n1
 
                 with open(regret_thresholds_file, "a") as f:
-                    f.write(f"\t- Threshold {t}: Count {count}, Fraction {fraction:.6f}, Num. Iters to Reach {num_iters_to_exceed:.1f} \n")
+                    f.write(f"\t- Threshold {t}: Scenario Count {count}, Scenario Fraction {fraction:.6f}, Experiment Count {len(iters)} / {n1}, Experiment Fraction {exp_frac:.6f}, Num. Iters to Reach (for the corresponding experiments) {num_iters_to_exceed:.1f} \n")
 
             # Find maximum regret achieved
             max_regrets = np.max(group_regrets[group_name],axis=-1)
