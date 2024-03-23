@@ -37,7 +37,6 @@ set(srv_files
   "srv/NotifyReady.srv"
   "srv/RegisterVehicleNode.srv"
   "srv/RunScenario.srv"
-  # "srv/SceneCapture.srv"
   "srv/WorkerIssueNotification.srv"
 )
 
