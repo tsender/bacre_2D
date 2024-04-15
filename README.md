@@ -17,7 +17,20 @@ Note: For convenience, both `auto_scene_gen_*` packages have been copied directl
 
 If you use our work in an academic context, we would greatly appreciate it if you used the following citation:
 
-Coming Soon
+```
+@ARTICLE{10496154,
+  author={Sender, Ted and Brudnak, Mark and Steiger, Reid and Vasudevan, Ram and Epureanu, Bogdan},
+  journal={IEEE Robotics and Automation Letters}, 
+  title={A Regret-Informed Evolutionary Approach for Generating Adversarial Scenarios for Black-Box Off-Road Autonomy Systems}, 
+  year={2024},
+  volume={},
+  number={},
+  pages={1-8},
+  keywords={Trajectory;Closed box;Testing;Costs;Navigation;Complexity theory;Vehicle dynamics;Simulation and Animation;Planning under Uncertainty;Software, Middleware and Programming Environments},
+  doi={10.1109/LRA.2024.3387109}}
+```
+
+The journal article can be found [here](https://ieeexplore.ieee.org/document/10496154).
 
 ## Installation
 
