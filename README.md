@@ -27,7 +27,8 @@ If you use our work in an academic context, we would greatly appreciate it if yo
   number={6},
   pages={5354-5361},
   keywords={Trajectory;Closed box;Testing;Costs;Navigation;Complexity theory;Vehicle dynamics;Planning under uncertainty;simulation and animation;software, middleware and programming environments},
-  doi={10.1109/LRA.2024.3387109}}
+  doi={10.1109/LRA.2024.3387109}
+}
 ```
 
 The journal article can be found [here](https://ieeexplore.ieee.org/document/10496154).
