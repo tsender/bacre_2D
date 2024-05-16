@@ -2315,7 +2315,6 @@ class BACRE2DAstarTrav(AutoSceneGenClient):
                                   scenario: Scenario, 
                                   file_name_prefix: str, 
                                   format : str = "portrait", 
-                                  b_add_legend: bool = False, 
                                   b_use_annotated_side_images: bool = False,
                                   test_vehicle_paths: List[np.float32] = None):
         """Main function for plotting scenes.
@@ -2404,20 +2403,20 @@ class BACRE2DAstarTrav(AutoSceneGenClient):
             fig.savefig(file_name_prefix + "_pyplot.pdf", bbox_inches="tight")
         else:
             fig.subplots_adjust(wspace=0., hspace=0.)
-            if not b_add_legend:
-                fig.savefig(file_name_prefix + f"_figwidth{fig_width}.pdf", bbox_inches="tight", pad_inches=0.1*marker_scale)
-                fig.savefig(file_name_prefix + f"_figwidth{fig_width}.png", bbox_inches="tight", pad_inches=0.1*marker_scale, dpi=dpi)
 
-                # Add legend
-                if format == "landscape":
-                    legend = fig.legend(handles, labels, loc='upper center', ncol=3, bbox_to_anchor=(.5, 0.05), fontsize=fontsize)
-                elif format == "portrait":
-                    legend = main_ax.legend(handles, labels, loc='upper center', ncol=3, bbox_to_anchor=(.5, -0.05), fontsize=fontsize)
-                legend.get_frame().set_linewidth(0.8 * marker_scale)
-                legend.get_frame().set_facecolor(self.COLOR_LEGEND)
-                
-                fig.savefig(file_name_prefix + f"_wlegend_figwidth{fig_width}.pdf", bbox_inches="tight", pad_inches=0.1*marker_scale)
-                fig.savefig(file_name_prefix + f"_wlegend_figwidth{fig_width}.png", bbox_inches="tight", pad_inches=0.1*marker_scale, dpi=dpi)
+            fig.savefig(file_name_prefix + f"_figwidth{fig_width}.pdf", bbox_inches="tight", pad_inches=0.1*marker_scale)
+            fig.savefig(file_name_prefix + f"_figwidth{fig_width}.png", bbox_inches="tight", pad_inches=0.1*marker_scale, dpi=dpi)
+
+            # Add legend
+            if format == "landscape":
+                legend = fig.legend(handles, labels, loc='upper center', ncol=3, bbox_to_anchor=(.5, 0.05), fontsize=fontsize)
+            elif format == "portrait":
+                legend = main_ax.legend(handles, labels, loc='upper center', ncol=3, bbox_to_anchor=(.5, -0.05), fontsize=fontsize)
+            legend.get_frame().set_linewidth(0.8 * marker_scale)
+            legend.get_frame().set_facecolor(self.COLOR_LEGEND)
+            
+            fig.savefig(file_name_prefix + f"_wlegend_figwidth{fig_width}.pdf", bbox_inches="tight", pad_inches=0.1*marker_scale)
+            fig.savefig(file_name_prefix + f"_wlegend_figwidth{fig_width}.png", bbox_inches="tight", pad_inches=0.1*marker_scale, dpi=dpi)
 
         fig.clf()
         plt.close(fig)
