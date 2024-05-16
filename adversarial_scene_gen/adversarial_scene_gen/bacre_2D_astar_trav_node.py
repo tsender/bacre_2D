@@ -693,7 +693,7 @@ class BACRE2DAstarTrav(AutoSceneGenClient):
                 mode: str,                                      # Primary mode of operation, see MODE_* options above
                 num_runs_per_scenario: int,                     # Number of times we run each scenario for to predict the difficulty for the test vehicle
                 num_base_env: int,                              # Number of base or "seed" environments to create
-                num_env_to_generate: int,                       # Number of new environments to generate per iteration
+                num_env_to_generate: int,                       # Maximum number of environments to generate
                 num_mutations: int,                             # Number of mutations made when creating a child scenario
                 b_regret_uses_equivalent_x_errors: bool,        # Indicates if the regret calculation should ignore the equivalent-x errors
                 initial_prob_editing_random_env: float,         # Initial probability of choosing a random parent environment to edit
@@ -3889,7 +3889,7 @@ def main(args=None):
         "mode": BACRE2DAstarTrav.MODE_BACRE,         # Modes of operation
         "num_runs_per_scenario": 3,          # Number of times we run each scenario for to predict the difficulty for the test vehicle
         "num_base_env": 200,                               # Number of base or "seed" environments to create
-        "num_env_to_generate": 5000,                       # Number of new environments to generate per iteration
+        "num_env_to_generate": 5000,                       # Maximum number of environments to generate
         "num_mutations": 1,
         "b_regret_uses_equivalent_x_errors": True,
         "initial_prob_editing_random_env": 0.1, # .5,
